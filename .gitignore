@@ -42,3 +42,7 @@ wallet*.key
 *.swo
 *~
 ghtoken.txt
+jito-auth-keypair.json
+*.json.key
+*.pem
+.env
