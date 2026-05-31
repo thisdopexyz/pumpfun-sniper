@@ -64,12 +64,13 @@ export class PositionRegistry {
     return updated;
   }
 
-  /** Get all active positions (ENTERING, ENTERED, EXIT_PENDING) */
+  /** Get all active positions (ENTERING, ENTERED, EXIT_PENDING, SCALE_OUT_PARTIAL) */
   getActive(): ReadonlyArray<Position> {
     const activeStatuses: ReadonlySet<PositionStatus> = new Set([
       'ENTERING',
       'ENTERED',
       'EXIT_PENDING',
+      'SCALE_OUT_PARTIAL',
     ]);
     return [...this.positions.values()].filter((p) => activeStatuses.has(p.status));
   }

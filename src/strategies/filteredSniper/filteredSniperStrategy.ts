@@ -537,7 +537,7 @@ export class FilteredSniperStrategy implements IStrategy {
             // All scale-out tiers done — but DON'T mark as full exit yet!
             // 31.875% of position still rides with trailing stop / SL / TP.
             // Keep monitoring so trailing stop can lock remaining profits.
-            this.dataProvider.transitionPosition(tradeId, 'EXITED', 'SCALE_OUT_PARTIAL');
+            this.dataProvider.transitionPosition(tradeId, 'SCALE_OUT_PARTIAL', 'SCALE_OUT_ALL_TIERS');
             this.monitoredTrades.add(tradeId);
             logger.info('All scale-out tiers complete — remaining position rides trailing stop', {
               tradeId,
@@ -547,8 +547,8 @@ export class FilteredSniperStrategy implements IStrategy {
             });
           } else {
             // More tiers remaining — keep monitoring but mark as partially exited
-            // This prevents getActivePositionCount() from blocking new buys
-            this.dataProvider.transitionPosition(tradeId, 'EXITED', 'SCALE_OUT_PARTIAL');
+            // This BLOCKS getActivePositionCount() from opening new buys
+            this.dataProvider.transitionPosition(tradeId, 'SCALE_OUT_PARTIAL', 'SCALE_OUT_PARTIAL');
             this.monitoredTrades.add(tradeId);
             logger.info('Scale-out partial sell complete, re-monitoring for next tier', {
               tradeId,

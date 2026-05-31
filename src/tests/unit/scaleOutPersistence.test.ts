@@ -6,7 +6,7 @@
  * 2. Partial sell percentages: 50%, 25%, 15%
  * 3. Persistence across restarts (DB save/load)
  * 4. All tiers done → full exit
- * 5. Trailing stop only fires after all tiers done
+ * 5. Scale-out fires before trailing when tier threshold met
  */
 
 import { describe, it, expect } from 'vitest';
@@ -110,9 +110,9 @@ describe('Scale-out exit decisions', () => {
     expect(result.reason).not.toBe('SCALE_OUT');
   });
 
-  it('trailing stop fires ONLY after all tiers done', () => {
+  it('trailing stop fires independently of scale-out tiers', () => {
     // At +1000%, highest was +1500%, now dropped to +1000%
-    // Trailing should fire if all tiers done
+    // Trailing fires even with all tiers done
     const data = makeExitData({
       entryPriceLamports: 1000n,
       currentPriceLamports: 11000n, // +1000%
@@ -123,8 +123,8 @@ describe('Scale-out exit decisions', () => {
     expect(result.reason).toBe('TRAILING_STOP');
   });
 
-  it('trailing stop does NOT fire if tiers remain', () => {
-    // Even if price dropped from +1500% to +1000%
+  it('scale-out fires BEFORE trailing when tier threshold met', () => {
+    // Even if trailing would trigger, scale-out fires first when tier threshold hit
     const data = makeExitData({
       entryPriceLamports: 1000n,
       currentPriceLamports: 11000n, // +1000%

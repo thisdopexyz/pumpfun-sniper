@@ -64,6 +64,15 @@ async function getSolPriceWithFallback(oracle: { getSolPriceUsd(): Promise<numbe
 /** In-memory highest price tracking per trade. */
 const highestPriceTracker = new Map<string, bigint>();
 
+/**
+ * Graduation price ratio per trade.
+ * When a token transitions from BC to Jupiter, the two price systems use
+ * different magnitudes (BC virtual reserves vs real market). This ratio
+ * scales Jupiter prices to be BC-equivalent, keeping PNL continuous.
+ * ratio = lastBCPrice / firstJupiterPrice (computed once on graduation)
+ */
+const graduationPriceRatio = new Map<string, bigint>();
+
 /** Anti-rug triggered flags per mint (set by AntiRugMonitor callback). */
 const antiRugTriggeredMints = new Set<string>();
 
@@ -74,10 +83,19 @@ const JUPITER_PRICE_API = 'https://api.jup.ag/price/v2';
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
 /**
- * Fetch graduated token price from Jupiter Price API.
- * Returns price in lamports per raw token unit (6 decimals).
- * Cached for 5s to avoid hammering the API on every exit monitor poll.
- * Falls back to DexScreener if Jupiter returns null.
+ * Fetch graduated token price from external APIs.
+ * Returns a scaled BigInt price (NOT lamports per raw token).
+ * The graduationPriceRatio mechanism in getPositionData handles the unit
+ * conversion to match BC/entry prices.
+ *
+ * Scaling: 10^9 (not 10^6) to preserve precision for very cheap tokens
+ * (e.g., $0.000001 per token → 10^6 would round to 0).
+ *
+ * Sources (in order):
+ *   1. Jupiter Price API v2 (currently 404 — kept for when it returns)
+ *   2. DexScreener (priceNative = SOL per whole token, no CoinGecko needed)
+ *
+ * Cached for 5s to avoid hammering APIs on every exit monitor poll.
  */
 async function fetchGraduatedPriceLamports(mint: string): Promise<bigint | null> {
   const cached = graduatedPriceCache.get(mint);
@@ -85,7 +103,7 @@ async function fetchGraduatedPriceLamports(mint: string): Promise<bigint | null>
     return cached.priceLamports;
   }
 
-  // Try Jupiter first
+  // Try Jupiter Price API first
   try {
     const url = `${JUPITER_PRICE_API}?ids=${mint}&vsToken=${SOL_MINT}`;
     const controller = new AbortController();
@@ -102,10 +120,13 @@ async function fetchGraduatedPriceLamports(mint: string): Promise<bigint | null>
       const priceSol = data.data?.[mint]?.price;
 
       if (typeof priceSol === 'number' && priceSol > 0) {
-        const priceLamports = BigInt(Math.round(priceSol * 1_000_000_000));
-        graduatedPriceCache.set(mint, { priceLamports, fetchedAt: nowMs() });
-        logger.debug('Jupiter graduated price fetched', { mint, priceSol, priceLamports: priceLamports.toString() });
-        return priceLamports;
+        // Scale by 10^9 for precision (cheap tokens need more digits)
+        const priceScaled = BigInt(Math.round(priceSol * 1_000_000_000));
+        if (priceScaled > 0n) {
+          graduatedPriceCache.set(mint, { priceLamports: priceScaled, fetchedAt: nowMs() });
+          logger.debug('Jupiter graduated price fetched', { mint, priceSol, priceScaled: priceScaled.toString() });
+          return priceScaled;
+        }
       }
     }
   } catch (err: unknown) {
@@ -115,7 +136,7 @@ async function fetchGraduatedPriceLamports(mint: string): Promise<bigint | null>
     });
   }
 
-  // Fallback: DexScreener
+  // Fallback: DexScreener (priceNative = SOL per whole token, direct — no CoinGecko)
   try {
     const url = `https://api.dexscreener.com/latest/dex/tokens/${mint}`;
     const controller = new AbortController();
@@ -128,22 +149,40 @@ async function fetchGraduatedPriceLamports(mint: string): Promise<bigint | null>
     clearTimeout(timer);
 
     if (response.ok) {
-      const data = await response.json() as { pairs?: Array<{ priceUsd?: string; quoteToken?: string }> };
+      const data = await response.json() as { pairs?: Array<{ priceNative?: string; priceUsd?: string }> };
       const pair = data.pairs?.[0];
+
+      // Prefer priceNative (SOL per token) — no CoinGecko dependency
+      if (pair?.priceNative) {
+        const priceSol = parseFloat(pair.priceNative);
+        if (priceSol > 0) {
+          const priceScaled = BigInt(Math.round(priceSol * 1_000_000_000));
+          if (priceScaled > 0n) {
+            graduatedPriceCache.set(mint, { priceLamports: priceScaled, fetchedAt: nowMs() });
+            logger.info('DexScreener graduated price fetched (priceNative)', {
+              mint, priceSol, priceScaled: priceScaled.toString(),
+            });
+            return priceScaled;
+          }
+        }
+      }
+
+      // Fallback: priceUsd + CoinGecko conversion
       if (pair?.priceUsd) {
         const priceUsd = parseFloat(pair.priceUsd);
         if (priceUsd > 0) {
-          // Get SOL price to convert USD → SOL → lamports
           const solResp = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
           const solData = await solResp.json() as { solana?: { usd?: number } };
           const solPrice = solData?.solana?.usd ?? SOL_FALLBACK_PRICE_USD;
           const priceSol = priceUsd / solPrice;
-          const priceLamports = BigInt(Math.round(priceSol * 1_000_000_000));
-          graduatedPriceCache.set(mint, { priceLamports, fetchedAt: nowMs() });
-          logger.info('DexScreener graduated price fetched (Jupiter fallback)', {
-            mint, priceUsd, priceSol, priceLamports: priceLamports.toString(),
-          });
-          return priceLamports;
+          const priceScaled = BigInt(Math.round(priceSol * 1_000_000_000));
+          if (priceScaled > 0n) {
+            graduatedPriceCache.set(mint, { priceLamports: priceScaled, fetchedAt: nowMs() });
+            logger.info('DexScreener graduated price fetched (priceUsd+CoinGecko)', {
+              mint, priceUsd, priceSol, priceScaled: priceScaled.toString(),
+            });
+            return priceScaled;
+          }
         }
       }
     }
@@ -510,6 +549,7 @@ export function createDataProvider(
       if (!pos) {
         // Clean up price trackers for exited positions to prevent memory leak
         highestPriceTracker.delete(tradeId);
+        graduationPriceRatio.delete(tradeId);
         return null;
       }
 
@@ -617,19 +657,48 @@ export function createDataProvider(
       }
 
       // Graduated: bonding curve drained → fetch real price from Jupiter/Raydium
-      if (graduated) {
-        const jupiterPrice = await fetchGraduatedPriceLamports(pos.mint);
-        if (jupiterPrice !== null && jupiterPrice > 0n) {
-          currentPriceLamports = jupiterPrice;
+    // Jupiter Price API returns SOL per whole token (post-decimal), while BC/entry
+    // prices are in lamports per raw token unit (pre-decimal). The scale difference
+    // depends on the token's decimals (typically 10^3 for 6-decimal tokens).
+    //
+    // Fix: always compute a ratio = prevBCPrice / firstJupiterPrice on first
+    // graduation detection. This captures the exact scale difference without
+    // needing to know the token's decimals. All subsequent Jupiter prices are
+    // scaled by this ratio to maintain PNL continuity from entry.
+    if (graduated) {
+      const jupiterPrice = await fetchGraduatedPriceLamports(pos.mint);
+      if (jupiterPrice === null || jupiterPrice <= 0n) {
+        // price fetch failed — treated as rug; keep 0 so SL can fire
+      } else {
+        const existingRatio = graduationPriceRatio.get(posTradeId);
+        if (existingRatio !== undefined) {
+          // Already graduated — apply stored ratio for PNL continuity
+          currentPriceLamports = jupiterPrice * existingRatio / 1_000_000_000n;
+        } else if (prevHighest > 0n) {
+          // First graduation detection — compute and store ratio.
+          // ratio = prevBCPrice / jupiterPrice captures the scale difference
+          // between BC (lamports/raw) and Jupiter (SOL/whole_token).
+          // Jupiter scaled by 10^9, BC by 10^6 → ratio ~10^3 for 6-decimal tokens.
+          // Cap at 10^12 to handle extreme cases while rejecting truly broken values.
+          const ratio = prevHighest * 1_000_000_000n / jupiterPrice;
+          if (ratio > 0n && ratio < 1_000_000_000_000n) {
+            graduationPriceRatio.set(posTradeId, ratio);
+            currentPriceLamports = jupiterPrice * ratio / 1_000_000_000n;
+            logger.info('BC→Graduated: PNL continuity ratio computed', {
+              mint: pos.mint,
+              lastBCPrice: prevHighest.toString(),
+              firstJupiterPrice: jupiterPrice.toString(),
+              scaledPrice: currentPriceLamports.toString(),
+            });
+          } else {
+            currentPriceLamports = jupiterPrice;
+          }
         } else {
-          // Both Jupiter and DexScreener failed — token likely rugged.
-          // Do NOT fall back to prevHighest — let price stay at 0 so SL triggers.
-          logger.error('Graduated token price unavailable from all sources (rug?)', {
-            mint: pos.mint,
-            prevHighest: prevHighest.toString(),
-          });
+          // No BC price history (e.g., graduated before first poll)
+          currentPriceLamports = jupiterPrice;
         }
       }
+    }
 
       // Safety: if currentPrice is STILL 0 but we have a previous highest,
       // use it. A real price crash to exactly 0 is extremely rare (rug pull

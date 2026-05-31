@@ -72,6 +72,7 @@ import { PumpfunVenue } from '../execution/venues/pumpfunVenue.js';
 import { BonkfunVenue } from '../execution/venues/bonkfunVenue.js';
 import { JupiterVenue } from '../execution/venues/jupiterVenue.js';
 import { RpcSender } from '../execution/sender/rpcSender.js';
+// import { JitoSender } from '../execution/sender/jitoSender.js'; // Disabled
 import { SendCoordinator } from '../execution/sender/sendCoordinator.js';
 import { KeypairSigner } from '../execution/signing/keypairSigner.js';
 import { TradeLifecycleManager } from '../execution/lifecycle/tradeLifecycleManager.js';
@@ -159,7 +160,9 @@ export class ServiceContainer {
   private _tokenBlacklist: TokenBlacklist | null = null;
   private _txBuilder: TxBuilder | null = null;
   private _rpcSender: RpcSender | null = null;
+  // private _jitoSender: JitoSender | null = null; // Disabled
   private _sendCoordinator: SendCoordinator | null = null;
+  private _sellSendCoordinator: SendCoordinator | null = null;
   private _pumpfunVenue: PumpfunVenue | null = null;
   private _bonkfunVenue: BonkfunVenue | null = null;
   private _jupiterVenue: JupiterVenue | null = null;
@@ -396,11 +399,38 @@ export class ServiceContainer {
     return this._rpcSender;
   }
 
+  // JitoSender disabled — bundles not landing in blocks before TX expires
+  // private get jitoSender(): JitoSender {
+  //   if (this._jitoSender === null) {
+  //     this._jitoSender = new JitoSender(this.connection, 'mainnet', {
+  //       tipLamports: 100_000,
+  //       timeoutMs: 5_000,
+  //     });
+  //   }
+  //   return this._jitoSender;
+  // }
+
   get sendCoordinator(): SendCoordinator {
     if (this._sendCoordinator === null) {
-      this._sendCoordinator = new SendCoordinator(this.signer, this.rpcSender);
+      // Use RpcSender directly (Jito disabled — bundles not landing in blocks)
+      this._sendCoordinator = new SendCoordinator(
+        this.signer,
+        this.rpcSender,
+      );
     }
     return this._sendCoordinator;
+  }
+
+  /** Sell-specific send coordinator — uses RpcSender directly for speed. */
+  get sellSendCoordinator(): SendCoordinator {
+    if (this._sellSendCoordinator === null) {
+      // Use RpcSender directly for sells (faster confirmation)
+      this._sellSendCoordinator = new SendCoordinator(
+        this.signer,
+        this.rpcSender,
+      );
+    }
+    return this._sellSendCoordinator;
   }
 
   get pumpfunVenue(): PumpfunVenue {

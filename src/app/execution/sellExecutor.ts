@@ -158,7 +158,7 @@ export async function executeSell(params: SellParams, runtime: ExecutionRuntime)
         return { success: false, signature: null, error: 'Jupiter swap build failed' };
       }
 
-      const sendResult = await container.sendCoordinator.signAndSend({
+      const sendResult = await container.sellSendCoordinator.signAndSend({
         tradeId: `sell-${tradeId}-${sellSendRunId}-jupiter`,
         transaction: jupiterSwap.transaction,
       });
@@ -320,7 +320,7 @@ export async function executeSell(params: SellParams, runtime: ExecutionRuntime)
             instructions: bonkfunResult.instructions,
           });
 
-          const sendResult = await container.sendCoordinator.signAndSend({
+          const sendResult = await container.sellSendCoordinator.signAndSend({
             tradeId: `bonkfun-sell-${tradeId}-${sellSendRunId}-attempt-${attempt}`,
             transaction: txResult.transaction,
           });
@@ -608,7 +608,7 @@ export async function executeSell(params: SellParams, runtime: ExecutionRuntime)
         instructions,
       });
 
-      const sendResult = await container.sendCoordinator.signAndSend({
+      const sendResult = await container.sellSendCoordinator.signAndSend({
         tradeId: `sell-${tradeId}-${sellSendRunId}-attempt-${attempt}`,
         transaction: txResult.transaction,
       });

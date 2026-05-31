@@ -90,6 +90,10 @@ export class TxBuilder {
       lastValidBlockHeight = result.lastValidBlockHeight;
     }
 
+    // Note: Jito tip is handled as a SEPARATE transaction in the bundle
+    // by JitoSender, NOT as an instruction in the main TX.
+    // This is the correct approach per Jito SDK documentation.
+
     // Create V0 message
     const messageV0 = new TransactionMessage({
       payerKey: params.feePayer,

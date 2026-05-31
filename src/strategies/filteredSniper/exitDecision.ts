@@ -169,9 +169,12 @@ export function evaluateExit(data: PositionData): ExitDecisionResult {
 
   // --- Check 2: Trailing stop (activates after TRAILING_ACTIVATION_PCT profit) ---
   // Trails from highest price seen. Dynamic tightening as profit increases.
-  // ONLY triggers when all scale-out tiers are completed (to avoid selling 100% while tiers remain).
+  // Trailing stop is INDEPENDENT of scale-out tiers — it protects remaining position
+  // from large drops even when next tier threshold hasn't been reached.
+  // Scale-out (priority 1.5) fires first if a tier trigger is hit; trailing (priority 2)
+  // catches the fall when no tier triggers but price drops significantly from peak.
   const allScaleOutTiersDone = !SCALE_OUT_ENABLED || (data.scaleOutTiersCompleted?.length ?? 0) >= SCALE_OUT_TIERS.length;
-  if (TRAILING_STOP_PCT > 0 && data.highestPriceLamports && data.entryPriceLamports > 0n && allScaleOutTiersDone) {
+  if (TRAILING_STOP_PCT > 0 && data.highestPriceLamports && data.entryPriceLamports > 0n) {
     const highestPnlBps = ((data.highestPriceLamports - data.entryPriceLamports) * 10000n) / data.entryPriceLamports;
     const activationBps = BigInt(TRAILING_ACTIVATION_PCT * 100);
     // Only trail if highest exceeded activation threshold

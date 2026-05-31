@@ -11,6 +11,7 @@ import type { VersionedTransaction } from '@solana/web3.js';
 import type { ISigner } from '../../core/interfaces/signer.js';
 import type { SendResult } from '../../core/types/execution.js';
 import type { RpcSender } from './rpcSender.js';
+import type { JitoSender } from './jitoSender.js';
 import { DedupeSet } from '../../core/utils/dedupe.js';
 import { createLogger } from '../../telemetry/logging/logger.js';
 
@@ -53,16 +54,19 @@ export interface SendCoordinatorConfig {
 
 export class SendCoordinator {
   private readonly signer: ISigner;
-  private readonly sender: RpcSender;
+  private readonly sender: RpcSender | JitoSender;
+  private readonly fallbackSender: RpcSender | null;
   private readonly dedupe: DedupeSet;
 
   constructor(
     signer: ISigner,
-    sender: RpcSender,
+    sender: RpcSender | JitoSender,
     config?: SendCoordinatorConfig,
+    fallbackSender?: RpcSender,
   ) {
     this.signer = signer;
     this.sender = sender;
+    this.fallbackSender = fallbackSender ?? null;
     this.dedupe = new DedupeSet(config?.dedupeTtlMs ?? 30_000);
   }
 
@@ -93,20 +97,58 @@ export class SendCoordinator {
       // Sign
       const signed = await this.signer.signVersionedTransaction(request.transaction);
 
-      // Send
-      const sendResult = await this.sender.send(signed);
+      // Try primary sender (Jito)
+      try {
+        // JitoSender needs signer to sign the tip transaction
+        const sendResult = await this.sender.send(signed, this.signer);
 
-      logger.info('Trade sent successfully', {
-        tradeId: request.tradeId,
-        signature: sendResult.signature,
-      });
+        logger.info('Trade sent successfully', {
+          tradeId: request.tradeId,
+          signature: sendResult.signature,
+          sender: this.sender.constructor.name,
+        });
 
-      return {
-        sendResult,
-        tradeId: request.tradeId,
-        isDuplicate: false,
-        error: null,
-      };
+        return {
+          sendResult,
+          tradeId: request.tradeId,
+          isDuplicate: false,
+          error: null,
+        };
+      } catch (primaryError: unknown) {
+        const primaryMessage = primaryError instanceof Error ? primaryError.message : String(primaryError);
+        
+        // If primary sender (Jito) fails and fallback exists, try fallback
+        if (this.fallbackSender) {
+          logger.warn('Primary sender failed, trying fallback', {
+            tradeId: request.tradeId,
+            primaryError: primaryMessage,
+            fallbackSender: this.fallbackSender.constructor.name,
+          });
+
+          try {
+            const sendResult = await this.fallbackSender.send(signed);
+
+            logger.info('Trade sent via fallback', {
+              tradeId: request.tradeId,
+              signature: sendResult.signature,
+              sender: 'RpcSender (fallback)',
+            });
+
+            return {
+              sendResult,
+              tradeId: request.tradeId,
+              isDuplicate: false,
+              error: null,
+            };
+          } catch (fallbackError: unknown) {
+            const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+            throw new Error(`Both senders failed. Primary: ${primaryMessage}, Fallback: ${fallbackMessage}`);
+          }
+        }
+
+        // No fallback available, re-throw primary error
+        throw primaryError;
+      }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       logger.error('Failed to sign and send', {

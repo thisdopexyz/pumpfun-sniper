@@ -189,17 +189,21 @@ describe('2. TRAILING STOP — dynamic tightening', () => {
     expect(r.sellPct).toBeUndefined(); // undefined = 100% (default)
   });
 
-  it('BLOCKED if scale-out tiers remain (but no tier triggers = no exit)', () => {
-    // current is -10% from entry, tier 2 needs +500% → no scale-out triggers
-    // trailing is blocked because tiers remain → NO EXIT (correct!)
+  it('TRAILING_STOP FIRES even when scale-out tiers remain (protects dead zone)', () => {
+    // BUG FIX: Previously trailing was blocked when tiers remained.
+    // This left positions unprotected in the "dead zone" — price not high enough
+    // for next tier but dropped significantly from peak.
+    // Entry=1000, highest=2000 (+100%), current=900 (-10% from entry, 55% drop from peak)
+    // No tier triggers at -10% PnL, but trailing should fire to protect position.
     const data = makeData({
       highestPriceLamports: 2000n, // +100%
-      currentPriceLamports: 900n, // -10% from entry
+      currentPriceLamports: 900n, // -10% from entry, 55% drop from peak
       scaleOutTiersCompleted: [0, 1], // tier 2 not done
     });
     const r = evaluateExit(data);
-    // No exit: trailing blocked (tiers remain), scale-out not triggered (-10% < +500%)
-    expect(r.shouldExit).toBe(false);
+    // trailing stop = 2000 * 50% = 1000, current 900 < 1000 → TRAILING_STOP fires
+    expect(r.reason).toBe('TRAILING_STOP');
+    expect(r.shouldExit).toBe(true);
   });
 
   it('Trailing BLOCKED, but scale-out fires if pnl above tier threshold', () => {
@@ -281,8 +285,8 @@ describe('PRIORITY ORDER', () => {
 
   it('Stop-loss > Take-profit (when SL triggers)', () => {
     const data = makeData({
-      currentPriceLamports: 400n, // -60%
-      highestPriceLamports: 400n, // never exceeded +100%
+      currentPriceLamports: 200n, // -80% (triggers SL at -80%)
+      highestPriceLamports: 200n, // never exceeded +100%
       scaleOutTiersCompleted: [0, 1, 2],
     });
     const r = evaluateExit(data);

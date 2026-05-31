@@ -61,6 +61,7 @@ export class RpcSender {
    */
   async send(
     tx: VersionedTransaction,
+    _signer?: any, // Ignored — RpcSender doesn't need signer
     options?: RpcSendOptions,
   ): Promise<SendResult> {
     const opts = { ...DEFAULT_SEND_OPTIONS, ...options };

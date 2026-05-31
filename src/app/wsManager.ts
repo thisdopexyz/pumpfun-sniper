@@ -62,40 +62,62 @@ export class WsManager {
   /**
    * Initiate the WebSocket connection.
    * Returns a promise that resolves once the initial connection is open.
+   * Retries on 429 rate limit with exponential backoff.
    */
   connect(): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       this.intentionalClose = false;
       this.retryCount = 0;
 
-      const onOpenHandler = (): void => {
-        logger.info('WebSocket connected');
-        cleanupTimeout();
-        this.retryCount = 0;
-        this.onOpen?.();
-        resolve();
+      const maxRetries = 5;
+      const baseDelay = 5000; // 5 seconds
+
+      const attemptConnect = (): void => {
+        const onOpenHandler = (): void => {
+          logger.info('WebSocket connected');
+          cleanupTimeout();
+          this.retryCount = 0;
+          this.onOpen?.();
+          resolve();
+        };
+
+        const onErrorHandler = (err: Error): void => {
+          logger.error('WebSocket connection error', { error: err.message });
+          cleanupTimeout();
+          
+          // Check if it's a 429 rate limit
+          if (err.message.includes('429') && this.retryCount < maxRetries) {
+            this.retryCount++;
+            const delay = baseDelay * Math.pow(2, this.retryCount - 1);
+            logger.warn('WebSocket 429 rate limited, retrying', {
+              attempt: this.retryCount,
+              maxRetries,
+              delayMs: delay,
+            });
+            setTimeout(attemptConnect, delay);
+            return;
+          }
+          
+          reject(err);
+        };
+
+        this.ws = new WebSocket(this.url);
+
+        const timeoutId = setTimeout(() => {
+          cleanupTimeout();
+          reject(new Error('WebSocket connect timeout'));
+        }, DEFAULT_WS_CONNECT_TIMEOUT_MS);
+
+        const cleanupTimeout = (): void => {
+          clearTimeout(timeoutId);
+          this.ws?.removeListener('error', onErrorHandler);
+        };
+
+        this.ws.once('open', onOpenHandler);
+        this.ws.once('error', onErrorHandler);
       };
 
-      const onErrorHandler = (err: Error): void => {
-        logger.error('WebSocket connection error', { error: err.message });
-        cleanupTimeout();
-        reject(err);
-      };
-
-      this.ws = new WebSocket(this.url);
-
-      const timeoutId = setTimeout(() => {
-        cleanupTimeout();
-        reject(new Error('WebSocket connect timeout'));
-      }, DEFAULT_WS_CONNECT_TIMEOUT_MS);
-
-      const cleanupTimeout = (): void => {
-        clearTimeout(timeoutId);
-        this.ws?.removeListener('error', onErrorHandler);
-      };
-
-      this.ws.once('open', onOpenHandler);
-      this.ws.once('error', onErrorHandler);
+      attemptConnect();
 
       this.setupPersistentListeners();
     });

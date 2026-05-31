@@ -12,17 +12,17 @@
 // Position sizing
 // ---------------------------------------------------------------------------
 
-/** Position sizing — base $0.30 equivalent (used directly by strategy) */
-export const DEFAULT_POSITION_SIZE_USD = 0.3 as const;
+/** Position sizing — base $0.20 equivalent (used directly by strategy) */
+export const DEFAULT_POSITION_SIZE_USD = 0.2 as const;
 
-/** Dynamic position sizing — minimum $0.30 */
-export const DEFAULT_MIN_POSITION_SIZE_USD = 0.3 as const;
+/** Dynamic position sizing — minimum $0.20 */
+export const DEFAULT_MIN_POSITION_SIZE_USD = 0.2 as const;
 
-/** Dynamic position sizing — maximum $0.30 */
-export const DEFAULT_MAX_POSITION_SIZE_USD = 0.3 as const;
+/** Dynamic position sizing — maximum $0.20 */
+export const DEFAULT_MAX_POSITION_SIZE_USD = 0.2 as const;
 
-/** Dynamic position sizing — base (center) $0.30 */
-export const DEFAULT_BASE_POSITION_SIZE_USD = 0.3 as const;
+/** Dynamic position sizing — base (center) $0.20 */
+export const DEFAULT_BASE_POSITION_SIZE_USD = 0.2 as const;
 
 // ---------------------------------------------------------------------------
 // Take profit / Stop loss / Trailing
@@ -31,8 +31,8 @@ export const DEFAULT_BASE_POSITION_SIZE_USD = 0.3 as const;
 /** Take profit — LOCKED: +1500% */
 export const DEFAULT_TAKE_PROFIT_PCT = 1500 as const;
 
-/** Stop loss — LOCKED: -60% */
-export const DEFAULT_STOP_LOSS_PCT = 60 as const;
+/** Stop loss — LOCKED: -80% */
+export const DEFAULT_STOP_LOSS_PCT = 80 as const;
 
 /** Trailing stop — activates after this % profit from entry. 0 = always active. */
 export const DEFAULT_TRAILING_ACTIVATION_PCT = 100 as const;
@@ -47,7 +47,7 @@ export const DEFAULT_TRAILING_STOP_PCT = 50 as const;
 /** Timeout — LOCKED: 6 hours (21600 seconds) */
 export const DEFAULT_TIMEOUT_SECONDS = 21600 as const;
 
-/** Max concurrent positions — LOCKED: 1 */
+/** Max concurrent positions — 1 */
 export const DEFAULT_MAX_CONCURRENT_POSITIONS = 1 as const;
 
 // ---------------------------------------------------------------------------

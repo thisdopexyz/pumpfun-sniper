@@ -27,6 +27,8 @@ cleanup() {
 }
 trap cleanup SIGINT SIGTERM EXIT
 
+cd /home/ubuntu/workspace/pumpfun || exit 1
+
 while true; do
   echo "[$(date)] Starting pumpfun bot..."
   node dist/main.js 2>&1 &

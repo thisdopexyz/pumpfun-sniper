@@ -130,6 +130,18 @@ export class TradeRepository implements IRepository<TradeRecord, TradeId> {
   }
 
   /**
+   * Find confirmed SELL records for a trade (by ID prefix).
+   * Handles unique sell IDs: sell-${tradeId}-${sellSendRunId}
+   */
+  async findConfirmedSellsByTradeId(tradeId: string): Promise<readonly TradeRecord[]> {
+    const result = await query<TradeRow>({
+      text: `SELECT * FROM trades WHERE id LIKE $1 AND side = 'SELL' AND status = 'CONFIRMED'`,
+      values: [`sell-${tradeId}%`],
+    });
+    return result.rows.map(toTradeRecord);
+  }
+
+  /**
    * Confirmed BUY rows that do not yet have a confirmed SELL row.
    *
    * Used at startup to rehydrate in-memory position monitoring from Postgres.
@@ -145,14 +157,14 @@ export class TradeRepository implements IRepository<TradeRecord, TradeId> {
           AND b.amount_tokens > 0
           AND b.confirmed_at > NOW() - INTERVAL '24 hours'
           AND (
-            -- No matching sell at all
+            -- No matching sell at all (LIKE handles unique sell IDs)
             NOT EXISTS (
               SELECT 1
               FROM trades s
               WHERE s.side = 'SELL'
                 AND s.status = 'CONFIRMED'
                 AND s.mint = b.mint
-                AND s.id = ('sell-' || b.id)
+                AND s.id LIKE ('sell-' || b.id || '%')
             )
             OR
             -- Matching sell exists but is PARTIAL (sell tokens < buy tokens)
@@ -163,7 +175,7 @@ export class TradeRepository implements IRepository<TradeRecord, TradeId> {
               WHERE s.side = 'SELL'
                 AND s.status = 'CONFIRMED'
                 AND s.mint = b.mint
-                AND s.id = ('sell-' || b.id)
+                AND s.id LIKE ('sell-' || b.id || '%')
                 AND s.amount_tokens < b.amount_tokens
             )
           )

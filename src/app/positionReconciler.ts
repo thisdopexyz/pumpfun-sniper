@@ -73,20 +73,23 @@ export class PositionReconciler {
 
         if (!hasBalance) {
           // Token is gone from wallet but DB says OPEN
-          // Check if sell executor already saved a record (race condition guard)
-          const existingSell = await container.tradeRepository.findById(`sell-${trade.id}`);
-          if (existingSell && existingSell.status === 'CONFIRMED' && existingSell.signature) {
+          // Check if sell executor already saved a record (any confirmed sell for this trade)
+          const existingSells = await container.tradeRepository.findConfirmedSellsByTradeId(trade.id);
+          if (existingSells.length > 0) {
             // Sell executor already recorded this — don't overwrite with null
             logger.info('Reconciler skipped — sell executor already recorded', {
               tradeId: trade.id,
               mint: trade.mint,
-              existingSignature: existingSell.signature,
+              existingSellId: existingSells[0]!.id,
+              existingSignature: existingSells[0]!.signature,
             });
             // Still remove from position registry
             const pos = positionRegistry.get(trade.id);
             if (pos) {
               positionRegistry.transition(trade.id, 'EXITED', 'RECONCILED');
             }
+            // Remove from monitoring
+            monitoredTrades.delete(trade.id);
             continue;
           }
 

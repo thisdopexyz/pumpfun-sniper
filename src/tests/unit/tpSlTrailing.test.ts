@@ -3,7 +3,7 @@
  *
  * Constants (from trading.ts):
  *   TP = +1500%    (all scale-out tiers must be done first)
- *   SL = -60%      (always active)
+ *   SL = -80%      (always active)
  *   Trailing = dynamic:
  *     - Activation: +100% (highest must exceed this)
  *     - Default: 50% drop from highest
@@ -47,8 +47,8 @@ describe('Exit constants match rule.md', () => {
   it('TAKE_PROFIT = +1500%', () => {
     expect(TAKE_PROFIT_PERCENT).toBe(1500);
   });
-  it('STOP_LOSS = -60%', () => {
-    expect(STOP_LOSS_PERCENT).toBe(-60);
+  it('STOP_LOSS = -80%', () => {
+    expect(STOP_LOSS_PERCENT).toBe(-80);
   });
   it('TRAILING_STOP default = 50%', () => {
     expect(TRAILING_STOP_PCT).toBe(50);
@@ -73,11 +73,11 @@ describe('Exit constants match rule.md', () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('STOP_LOSS', () => {
-  it('triggers at exactly -60%', () => {
-    // entry=1000, current=400 → -60%
+  it('triggers at exactly -80%', () => {
+    // entry=1000, current=200 → -80%
     const data = makeExitData({
       entryPriceLamports: 1000n,
-      currentPriceLamports: 400n,
+      currentPriceLamports: 200n,
       highestPriceLamports: 1000n,
     });
     const result = evaluateExit(data);
@@ -107,12 +107,12 @@ describe('STOP_LOSS', () => {
     expect(result.reason).not.toBe('STOP_LOSS');
   });
 
-  it('triggers at -60% when trailing NOT active (highest below activation)', () => {
-    // entry=1000, highest=1500 (+50% < +100% activation), current=400 (-60%)
+  it('triggers at -80% when trailing NOT active (highest below activation)', () => {
+    // entry=1000, highest=1500 (+50% < +100% activation), current=200 (-80%)
     // Trailing doesn't activate because highest < +100%
     const data = makeExitData({
       entryPriceLamports: 1000n,
-      currentPriceLamports: 400n,
+      currentPriceLamports: 200n,
       highestPriceLamports: 1500n, // +50% — below activation
     });
     const result = evaluateExit(data);
@@ -339,10 +339,11 @@ describe('Priority order', () => {
   });
 
   it('STOP_LOSS fires when trailing NOT active', () => {
-    // entry=1000, highest=1500 (+50% < +100%), current=400 (-60%)
+    // entry=1000, highest=1500 (+50% < +100%), current=200 (-80%)
+    // SL = -80%, trailing nonaktif karena highest < activation
     const data = makeExitData({
       entryPriceLamports: 1000n,
-      currentPriceLamports: 400n,
+      currentPriceLamports: 200n,
       highestPriceLamports: 1500n, // below activation
       scaleOutTiersCompleted: [0, 1, 2],
     });

@@ -16,6 +16,7 @@ export type PositionStatus =
   | 'ENTERING'
   | 'ENTERED'
   | 'EXIT_PENDING'
+  | 'SCALE_OUT_PARTIAL'
   | 'EXITED'
   | 'FAILED'
   | 'STOPPED';
