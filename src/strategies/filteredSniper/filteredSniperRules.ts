@@ -34,6 +34,8 @@ import {
   DEFAULT_MAX_PRICE_IMPACT_BPS,
   DEFAULT_SCALE_OUT_ENABLED,
   DEFAULT_SCALE_OUT_TIERS,
+  DEFAULT_MIN_TOKEN_AGE_SECONDS,
+  DEFAULT_MAX_BUY_MCAP_USD,
 } from '../../core/constants/defaults.js';
 
 // ---------------------------------------------------------------------------
@@ -54,7 +56,7 @@ import {
  *   9. momentum threshold met
  *  10. price impact acceptable
  */
-export const ENTRY_CHECK_COUNT = 19;
+export const ENTRY_CHECK_COUNT = 23;
 
 /** Price impact rule: max price impact in basis points. LOCKED. */
 export const MAX_PRICE_IMPACT_BPS = DEFAULT_MAX_PRICE_IMPACT_BPS;
@@ -146,16 +148,16 @@ export const SCALE_OUT_TIERS = DEFAULT_SCALE_OUT_TIERS;
 // ---------------------------------------------------------------------------
 
 /** Check 3: Minimum creator score to pass (0-100). */
-export const MIN_CREATOR_SCORE = 45;
+export const MIN_CREATOR_SCORE = 30;
 
 /** Check 11: Maximum bundle percentage (0-100). */
-export const MAX_BUNDLE_PCT = 30;
+export const MAX_BUNDLE_PCT = 40;
 
 /** Check 12: Maximum wash trade score (0-100). */
 export const MAX_WASH_TRADE_SCORE = 60;
 
 /** Check 13: Minimum unique wallets in momentum window. */
-export const MIN_UNIQUE_WALLETS = 12;
+export const MIN_UNIQUE_WALLETS = 10;
 
 /** Check 14: Maximum sell ratio (sells as % of total trades). */
 export const MAX_SELL_RATIO_PCT = 60;
@@ -164,11 +166,35 @@ export const MAX_SELL_RATIO_PCT = 60;
 export const MIN_LIQUIDITY_DEPTH_LAMPORTS = 500_000_000n; // 0.5 SOL
 
 /** Check 16: Holder-bundle ratio — max bundle % when holder count is low. */
-export const HOLDER_BUNDLE_MAX_BUNDLE_PCT = 20;
+export const HOLDER_BUNDLE_MAX_BUNDLE_PCT = 30;
 export const HOLDER_BUNDLE_MAX_HOLDERS = 100;
 
-/** Check 17: Maximum holder-to-market-cap ratio. */
-export const MAX_HOLDER_MCAP_RATIO = 0.015;
+/** Check 17: Minimum holder floor — auto-pass if >= this regardless of ratio. */
+export const MIN_HOLDER_FLOOR = 30;
 
 /** Check 18: Maximum volume-to-market-cap ratio. */
 export const MAX_VOLUME_MCAP_RATIO = 5;
+
+/** Check 22: Minimum average buy size in lamports (anti micro-buy spam). */
+export const MIN_AVG_BUY_SIZE_LAMPORTS = 100_000_000n; // 0.1 SOL
+
+/** Check 23: Minimum holder count (standalone, independent of bundle). */
+export const MIN_HOLDER_COUNT = 20;
+
+// ---------------------------------------------------------------------------
+// Token Age & Market Cap Filters (LOCKED)
+// ---------------------------------------------------------------------------
+
+/**
+ * Check 20: Minimum token age in seconds before entry.
+ * Prevents buying tokens that are too fresh (bot chaos zone).
+ * Data source: secondsSinceLaunch from EntryCheckData.
+ */
+export const MIN_TOKEN_AGE_SECONDS = DEFAULT_MIN_TOKEN_AGE_SECONDS;
+
+/**
+ * Check 21: Maximum market cap (USD) at entry.
+ * Prevents buying tokens that have already pumped significantly.
+ * Data source: marketCapUsd from EntryCheckData.
+ */
+export const MAX_BUY_MCAP_USD = DEFAULT_MAX_BUY_MCAP_USD;

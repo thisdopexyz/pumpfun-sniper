@@ -22,12 +22,17 @@ export function recordPnlAndRisk(
   tradeId?: string,
   mint?: string,
 ): void {
-  const wasStopLoss = reason === 'STOP_LOSS' || reason === 'TIMEOUT' || reason === 'TRAILING_STOP';
+  const wasStopLoss = reason === 'STOP_LOSS' || reason === 'TIMEOUT' || reason === 'TRAILING_STOP' || reason === 'ANTI_RUG';
 
   container.dailyLossGuard.recordTrade(pnlUsd, wasStopLoss);
 
-  // Blacklist token on stop-loss exits to prevent re-entry
-  if (wasStopLoss && mint) {
+  // Blacklist token on loss exits to prevent re-entry
+  // BUT NOT for TIMEOUT if position was profitable (pnlUsd >= 0)
+  //   — timeout on a profitable position (e.g., after scale-out) shouldn't blacklist
+  // Note: BREAKEVEN_SL is not in wasStopLoss, so it's already excluded
+  const shouldBlacklist = wasStopLoss && mint &&
+    !(reason === 'TIMEOUT' && pnlUsd >= 0);
+  if (shouldBlacklist) {
     container.tokenBlacklist.handleStopLoss(mint);
     logger.info('Token blacklisted after stop-loss exit', { tradeId, mint: mint.slice(0, 12) });
   }
@@ -39,9 +44,10 @@ export function recordPnlAndRisk(
   if (reason !== 'SCALE_OUT') {
     // Loss exits (SL/TIMEOUT/TRAILING/ANTI_RUG): 120s cooldown
     // Win exits (TP/GRADUATED/MANUAL/etc.): 30s cooldown
-    const isLoss = wasStopLoss || reason === 'ANTI_RUG';
-    const cooldownSeconds = isLoss ? 120 : 30;
-    container.cooldownManager.activateCooldownForDuration(cooldownSeconds);
-    logger.info('Cooldown activated after exit', { tradeId, reason, cooldownSeconds, pnlUsd: pnlUsd.toFixed(4) });
+    // Breakeven exits (BREAKEVEN_SL): 30s cooldown (not a real loss)
+    const isBreakeven = reason === 'BREAKEVEN_SL';
+    const cooldownSeconds = wasStopLoss ? 120 : 30;
+    container.cooldownManager.activateCooldownForDuration(isBreakeven ? 30 : cooldownSeconds);
+    logger.info('Cooldown activated after exit', { tradeId, reason, cooldownSeconds: isBreakeven ? 30 : cooldownSeconds, pnlUsd: pnlUsd.toFixed(4) });
   }
 }

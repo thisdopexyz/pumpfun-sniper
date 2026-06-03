@@ -27,6 +27,8 @@ export interface ReconcilerConfig {
   readonly tradeRepository: OpenBuyTradeRepository;
   readonly monitorTrade: (tradeId: string, mint?: string) => void;
   readonly monitoredTrades: Set<string>;
+  /** Cleanup callback when a position is reconciled (manual sell detected). */
+  readonly cleanupMint?: (tradeId: string, mint: string) => void;
 }
 
 export class PositionReconciler {
@@ -88,8 +90,9 @@ export class PositionReconciler {
             if (pos) {
               positionRegistry.transition(trade.id, 'EXITED', 'RECONCILED');
             }
-            // Remove from monitoring
+            // Remove from monitoring + cleanup strategy-level state
             monitoredTrades.delete(trade.id);
+            try { this.config.cleanupMint?.(trade.id, trade.mint); } catch { /* best-effort */ }
             continue;
           }
 
@@ -133,8 +136,9 @@ export class PositionReconciler {
             }
           }
 
-          // Remove from monitoring
+          // Remove from monitoring + cleanup strategy-level state
           monitoredTrades.delete(trade.id);
+          try { this.config.cleanupMint?.(trade.id, trade.mint); } catch { /* best-effort */ }
 
           reconciled += 1;
         }

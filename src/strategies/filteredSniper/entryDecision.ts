@@ -1,10 +1,10 @@
 /**
  * Entry Decision
  *
- * Evaluates ALL 16 entry checks from rule.md before allowing a buy.
+ * Evaluates ALL 21 entry checks from rule.md before allowing a buy.
  * Every single check must pass. No shortcuts. No partial passes.
  *
- * The 16 checks (from rule.md):
+ * The 21 checks (from rule.md):
  *   1. Launch detected
  *   2. Creator not blacklisted
  *   3. Creator history acceptable
@@ -21,6 +21,11 @@
  *  14. Sell pressure acceptable (early dump detection)
  *  15. Liquidity depth sufficient (real SOL reserves)
  *  16. Holder-to-bundle ratio acceptable
+ *  17. Holder-MCap ratio acceptable
+ *  18. Volume-MCap ratio acceptable
+ *  19. Smart money presence (boost, never blocks)
+ *  20. Minimum token age (avoid bot chaos zone)
+ *  21. Maximum buy market cap (avoid already-pumped tokens)
  *
  * Strategy = business logic ONLY. No RPC, no DB, no protocol decoding.
  * All data is provided via the EntryCheckData interface.
@@ -41,8 +46,12 @@ import {
   MIN_LIQUIDITY_DEPTH_LAMPORTS,
   HOLDER_BUNDLE_MAX_BUNDLE_PCT,
   HOLDER_BUNDLE_MAX_HOLDERS,
-  MAX_HOLDER_MCAP_RATIO,
+  MIN_HOLDER_FLOOR,
   MAX_VOLUME_MCAP_RATIO,
+  MIN_TOKEN_AGE_SECONDS,
+  MAX_BUY_MCAP_USD,
+  MIN_AVG_BUY_SIZE_LAMPORTS,
+  MIN_HOLDER_COUNT,
 } from './filteredSniperRules.js';
 import { createLogger } from '../../telemetry/logging/logger.js';
 
@@ -291,7 +300,7 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
         passed,
         reason: passed
           ? `Bundle OK: ${data.bundlePct.toFixed(1)}%`
-          : `TOO BUNDLED: ${data.bundlePct.toFixed(1)}% supply in few wallets (max 30%)`,
+          : `TOO BUNDLED: ${data.bundlePct.toFixed(1)}% supply in few wallets (max 40%)`,
       };
     })(),
     // Check 12: Wash trade score acceptable (block if score > 60)
@@ -395,20 +404,23 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
       if (data.holderCount == null || data.marketCapUsd == null || data.marketCapUsd <= 0) {
         return { name: 'holder_mcap_ratio', passed: true, reason: 'Holder/MCap data unavailable — skipping' };
       }
-      const ratio = data.holderCount / data.marketCapUsd;
-      // Dynamic threshold: stricter for new tokens (coordinated buys happen in first few minutes)
-      const ageSec = data.secondsSinceLaunch ?? 9999;
-      const ageMultiplier = ageSec < 300 ? 1.33 :   // < 5 min: 1.3x stricter (0.02)
-                            ageSec < 600 ? 1.17 :   // < 10 min: 1.17x stricter (0.0175)
-                            1.0;                      // Normal (0.015)
-      const effectiveMax = MAX_HOLDER_MCAP_RATIO * ageMultiplier;
-      const passed = ratio <= effectiveMax;
+      // Auto-pass if holder count meets floor
+      if (data.holderCount >= MIN_HOLDER_FLOOR) {
+        return { name: 'holder_mcap_ratio', passed: true, reason: `Holder floor met: ${data.holderCount} >= ${MIN_HOLDER_FLOOR}` };
+      }
+      // Mcap-based tiers (looser for lower mcap, tighter for higher)
+      const mcap = data.marketCapUsd;
+      const ratio = data.holderCount / mcap;
+      const maxRatio = mcap < 5000 ? 0.05 :
+                       mcap < 10000 ? 0.03 :
+                       0.015;
+      const passed = ratio <= maxRatio;
       return {
         name: 'holder_mcap_ratio',
         passed,
         reason: passed
-          ? `Holder/MCap OK: ${data.holderCount} holders / $${data.marketCapUsd.toFixed(0)} mcap (ratio ${ratio.toFixed(4)}, max ${effectiveMax.toFixed(4)})`
-          : `HOLDER INFLATION: ${data.holderCount} holders but only $${data.marketCapUsd.toFixed(0)} mcap (ratio ${ratio.toFixed(4)}, max ${effectiveMax.toFixed(4)}, age ${ageSec}s) — coordinated dump pattern`,
+          ? `Holder/MCap OK: ${data.holderCount} holders / $${mcap.toFixed(0)} (ratio ${ratio.toFixed(4)}, max ${maxRatio})`
+          : `HOLDER INFLATION: ${data.holderCount} holders / $${mcap.toFixed(0)} (ratio ${ratio.toFixed(4)}, max ${maxRatio}) — coordinated dump pattern`,
       };
     })(),
     // Check 18: Volume-MCap ratio (catches wash trade / coordinated volume)
@@ -446,9 +458,78 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
           : `No smart money: score ${(data.smartMoneyScore ?? 0).toFixed(3)}`,
       };
     })(),
+
+    // Check 20: Minimum token age (avoid bot chaos zone)
+    // BLOCK if too young — first seconds are chaotic, no organic activity yet
+    // BLOCK if data unavailable — can't assess risk without age data
+    (() => {
+      if (data.secondsSinceLaunch == null) {
+        return { name: 'min_token_age', passed: false, reason: 'Token age unavailable — BLOCKING (no launch timestamp, risk too high)' };
+      }
+      const passed = data.secondsSinceLaunch >= MIN_TOKEN_AGE_SECONDS;
+      return {
+        name: 'min_token_age',
+        passed,
+        reason: passed
+          ? `Token age OK: ${data.secondsSinceLaunch}s (min ${MIN_TOKEN_AGE_SECONDS}s)`
+          : `TOO YOUNG: ${data.secondsSinceLaunch}s old (min ${MIN_TOKEN_AGE_SECONDS}s) — bot chaos zone, waiting for organic activity`,
+      };
+    })(),
+
+    // Check 21: Maximum buy market cap (avoid already-pumped tokens)
+    // BLOCK if mcap exceeds threshold — diminishing returns for small positions
+    // BLOCK if data unavailable — can't assess risk without mcap data
+    (() => {
+      if (data.marketCapUsd == null || data.marketCapUsd <= 0) {
+        return { name: 'max_buy_mcap', passed: false, reason: 'Market cap unavailable — BLOCKING (data unavailable, risk too high)' };
+      }
+      const passed = data.marketCapUsd <= MAX_BUY_MCAP_USD;
+      return {
+        name: 'max_buy_mcap',
+        passed,
+        reason: passed
+          ? `MCap OK: $${data.marketCapUsd.toFixed(0)} (max $${MAX_BUY_MCAP_USD.toLocaleString()})`
+          : `MCAP TOO HIGH: $${data.marketCapUsd.toFixed(0)} (max $${MAX_BUY_MCAP_USD.toLocaleString()}) — already pumped, diminishing returns`,
+      };
+    })(),
+
+    // Check 22: Minimum average buy size (anti micro-buy spam)
+    // BLOCK if avg buy size too low — likely bot micro-buy spam to fake momentum
+    // BLOCK if data unavailable — parsing must be correct to get on-chain data
+    (() => {
+      if (data.volumeLamports == null || data.buyCountInWindow == null || data.buyCountInWindow === 0) {
+        return { name: 'min_avg_buy_size', passed: false, reason: 'Avg buy size unavailable — BLOCKING (parsing failed, no on-chain data)' };
+      }
+      const avgBuySize = data.volumeLamports / BigInt(data.buyCountInWindow);
+      const passed = avgBuySize >= MIN_AVG_BUY_SIZE_LAMPORTS;
+      return {
+        name: 'min_avg_buy_size',
+        passed,
+        reason: passed
+          ? `Avg buy size OK: ${(Number(avgBuySize) / 1e9).toFixed(4)} SOL (min ${(Number(MIN_AVG_BUY_SIZE_LAMPORTS) / 1e9).toFixed(3)} SOL)`
+          : `AVG BUY TOO SMALL: ${(Number(avgBuySize) / 1e9).toFixed(4)} SOL (min ${(Number(MIN_AVG_BUY_SIZE_LAMPORTS) / 1e9).toFixed(3)} SOL) — likely micro-buy spam`,
+      };
+    })(),
+
+    // Check 23: Minimum holder count (standalone, independent of bundle check)
+    // BLOCK if holders too low — fake volume from few wallets
+    // BLOCK if data unavailable — parsing must be correct to get on-chain data
+    (() => {
+      if (data.holderCount == null) {
+        return { name: 'min_holder_count', passed: false, reason: 'Holder count unavailable — BLOCKING (parsing failed, no on-chain data)' };
+      }
+      const passed = data.holderCount >= MIN_HOLDER_COUNT;
+      return {
+        name: 'min_holder_count',
+        passed,
+        reason: passed
+          ? `Holder count OK: ${data.holderCount} (min ${MIN_HOLDER_COUNT})`
+          : `TOO FEW HOLDERS: ${data.holderCount} (min ${MIN_HOLDER_COUNT}) — likely fake volume from few wallets`,
+      };
+    })(),
   ];
 
-  // Validate we have exactly 19 checks (compile-time safety)
+  // Validate we have exactly 23 checks (compile-time safety)
   if (checks.length !== ENTRY_CHECK_COUNT) {
     throw new Error(
       `Entry check count mismatch: expected ${ENTRY_CHECK_COUNT}, got ${checks.length}`,

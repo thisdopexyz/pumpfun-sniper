@@ -9,13 +9,13 @@
 // ---------------------------------------------------------------------------
 
 /** Momentum entry filter — minimum buy count in the configured window */
-export const DEFAULT_MOMENTUM_MIN_BUYS = 10 as const;
+export const DEFAULT_MOMENTUM_MIN_BUYS = 15 as const;
 
 /** Momentum entry filter — LOCKED: buy-count window in seconds */
 export const DEFAULT_MOMENTUM_WINDOW_SECONDS = 30 as const;
 
 /** Momentum entry filter — LOCKED: minimum buy volume in lamports */
-export const DEFAULT_MOMENTUM_MIN_VOLUME_LAMPORTS = 2_000_000_000n as const;
+export const DEFAULT_MOMENTUM_MIN_VOLUME_LAMPORTS = 10_000_000_000n as const;
 
 /** Momentum detector cooldown per mint in ms before re-emitting */
 export const DEFAULT_MOMENTUM_COOLDOWN_MS = 60_000 as const;
@@ -81,6 +81,36 @@ export const DEFAULT_METADATA_STRUCTURAL_PATTERNS: readonly RegExp[] = [
   /^asdf/i,       // Keyboard mash
   /^aaa+$/i,      // Repeated characters
 ] as const;
+
+// ---------------------------------------------------------------------------
+// Token age entry filter
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimum token age in seconds before allowing entry.
+ * Prevents buying tokens that are too fresh — first few seconds are chaotic
+ * bot territory with no organic activity. Gives time for initial dust to settle.
+ *
+ * Rationale: 30s is enough for the first wave of organic buyers to show up,
+ * while still catching tokens early in their lifecycle.
+ */
+export const DEFAULT_MIN_TOKEN_AGE_SECONDS = 1800 as const;
+
+// ---------------------------------------------------------------------------
+// Market cap entry filter
+// ---------------------------------------------------------------------------
+
+/**
+ * Maximum market cap (USD) at entry time.
+ * Prevents buying tokens that have already pumped significantly.
+ * For a $0.23 position, tokens above $50k mcap offer diminishing returns.
+ *
+ * PumpFun bonding curve context:
+ *   - Graduation to Raydium happens ~$69k mcap
+ *   - Sweet spot for sniping: $5k-$30k mcap
+ *   - Above $50k = likely already on Raydium or about to graduate
+ */
+export const DEFAULT_MAX_BUY_MCAP_USD = 20_000 as const;
 
 // ---------------------------------------------------------------------------
 // Wallet concentration

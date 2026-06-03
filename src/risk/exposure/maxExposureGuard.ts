@@ -4,10 +4,11 @@
  * Prevents opening new positions when max concurrent positions
  * or max total exposure is reached.
  *
- * LOCKED VALUES:
- *   - Max concurrent positions: 1
- *   - Position size: $1
- *   → Max exposure = $1 (1 position × $1)
+ * Dynamic behavior:
+ *   - Base limit = DEFAULT_MAX_CONCURRENT_POSITIONS (2)
+ *   - After scale-out tier 0: +1 (capital partially recovered)
+ *   - Hard cap: MAX_POSITIONS_CAP (5)
+ *   - On full exit: -1 (down to base)
  *
  * Risk = capital preservation ONLY. No execution, no strategy logic.
  */
@@ -49,7 +50,7 @@ export interface PositionProvider {
 
 /** Configuration. */
 export interface MaxExposureGuardConfig {
-  /** Max concurrent positions. Default: 1 (LOCKED). */
+  /** Max concurrent positions. Default: 2. */
   readonly maxConcurrentPositions?: number;
 }
 
@@ -57,16 +58,61 @@ export interface MaxExposureGuardConfig {
 // MaxExposureGuard
 // ---------------------------------------------------------------------------
 
+/** Hard cap — max positions can never exceed this. */
+const MAX_POSITIONS_CAP = 5;
+
 export class MaxExposureGuard {
-  private readonly maxPositions: number;
+  private maxPositions: number;
+  /** Base limit — floor for maxPositions. */
+  private readonly basePositions: number;
   /** Exposed for synchronous re-checks in buy flow. */
   get maxConcurrentPositions(): number { return this.maxPositions; }
   private readonly positionProvider: PositionProvider;
 
   constructor(positionProvider: PositionProvider, config?: MaxExposureGuardConfig) {
     this.positionProvider = positionProvider;
-    this.maxPositions =
-      config?.maxConcurrentPositions ?? DEFAULT_MAX_CONCURRENT_POSITIONS;
+    this.basePositions = config?.maxConcurrentPositions ?? DEFAULT_MAX_CONCURRENT_POSITIONS;
+    this.maxPositions = this.basePositions;
+  }
+
+  /**
+   * Increment max concurrent positions (e.g. after scale-out tier 0).
+   * Capped at MAX_POSITIONS_CAP.
+   */
+  addMaxPositions(delta: number): number {
+    const prev = this.maxPositions;
+    this.maxPositions = Math.min(this.maxPositions + delta, MAX_POSITIONS_CAP);
+    logger.info('Max positions increased', {
+      prev,
+      newMax: this.maxPositions,
+      delta,
+      capped: this.maxPositions === MAX_POSITIONS_CAP,
+    });
+    return this.maxPositions;
+  }
+
+  /**
+   * Decrement max concurrent positions (e.g. after full exit).
+   * Floor at basePositions.
+   */
+  removeMaxPositions(delta: number): number {
+    const prev = this.maxPositions;
+    this.maxPositions = Math.max(this.maxPositions - delta, this.basePositions);
+    logger.info('Max positions decreased', {
+      prev,
+      newMax: this.maxPositions,
+      delta,
+    });
+    return this.maxPositions;
+  }
+
+  /**
+   * Set max positions directly (for restoring from persisted state).
+   * Clamped to [basePositions, MAX_POSITIONS_CAP].
+   */
+  setMaxPositions(value: number): void {
+    this.maxPositions = Math.max(this.basePositions, Math.min(value, MAX_POSITIONS_CAP));
+    logger.info('Max positions restored', { newMax: this.maxPositions });
   }
 
   /**

@@ -167,13 +167,33 @@ export function evaluateExit(data: PositionData): ExitDecisionResult {
     }
   }
 
+  // --- Check 1.7: Breakeven SL after scale-out tier 0 (BEFORE trailing stop) ---
+  // After tier 0 partial sell, remaining position should ride with BE at entry.
+  // Without this, trailing stop (priority 2) would fire ABOVE entry, overriding
+  // the user's intent that BE = entry price after securing partial profit.
+  const allScaleOutTiersDone = !SCALE_OUT_ENABLED || (data.scaleOutTiersCompleted?.length ?? 0) >= SCALE_OUT_TIERS.length;
+  const tier0DoneForBE = data.scaleOutTiersCompleted?.includes(0) ?? false;
+  if (tier0DoneForBE && data.entryPriceLamports > 0n && pnlPercent <= 0) {
+    logger.warn('Exit decision: BREAKEVEN_SL triggered (pre-trailing, after tier 0)', {
+      tradeId: data.tradeId,
+      mint: data.mint,
+      pnlPercent: pnlPercent.toFixed(2),
+    });
+    return {
+      shouldExit: true,
+      reason: 'BREAKEVEN_SL',
+      pnlPercent,
+      elapsedMs,
+      explanation: `Breakeven SL triggered: P&L ${pnlPercent.toFixed(2)}% <= 0% (entry protection after scale-out)`,
+    };
+  }
+
   // --- Check 2: Trailing stop (activates after TRAILING_ACTIVATION_PCT profit) ---
   // Trails from highest price seen. Dynamic tightening as profit increases.
   // Trailing stop is INDEPENDENT of scale-out tiers — it protects remaining position
   // from large drops even when next tier threshold hasn't been reached.
   // Scale-out (priority 1.5) fires first if a tier trigger is hit; trailing (priority 2)
   // catches the fall when no tier triggers but price drops significantly from peak.
-  const allScaleOutTiersDone = !SCALE_OUT_ENABLED || (data.scaleOutTiersCompleted?.length ?? 0) >= SCALE_OUT_TIERS.length;
   if (TRAILING_STOP_PCT > 0 && data.highestPriceLamports && data.entryPriceLamports > 0n) {
     const highestPnlBps = ((data.highestPriceLamports - data.entryPriceLamports) * 10000n) / data.entryPriceLamports;
     const activationBps = BigInt(TRAILING_ACTIVATION_PCT * 100);
@@ -183,13 +203,13 @@ export function evaluateExit(data: PositionData): ExitDecisionResult {
       const highestPnlPercent = Number(highestPnlBps) / 100;
       let dynamicTrailingPct: number;
       if (highestPnlPercent >= 1000) {
-        dynamicTrailingPct = 20; // At 1000%+, trail by 20%
+        dynamicTrailingPct = 15; // At 1000%+, trail by 15%
       } else if (highestPnlPercent >= 500) {
-        dynamicTrailingPct = 30; // At 500%+, trail by 30%
+        dynamicTrailingPct = 20; // At 500%+, trail by 20%
       } else if (highestPnlPercent >= 200) {
-        dynamicTrailingPct = 40; // At 200%+, trail by 40%
+        dynamicTrailingPct = 25; // At 200%+, trail by 25%
       } else {
-        dynamicTrailingPct = TRAILING_STOP_PCT; // Default (50%)
+        dynamicTrailingPct = TRAILING_STOP_PCT; // Default (30%)
       }
       // Trailing stop price = highest * (100 - trailingPct) / 100
       const trailingStopPrice = (data.highestPriceLamports * BigInt(100 - dynamicTrailingPct)) / 100n;
@@ -233,7 +253,8 @@ export function evaluateExit(data: PositionData): ExitDecisionResult {
     };
   }
 
-  // --- Check 3: Stop loss ---
+  // --- Check 3: Stop loss (base -50% for positions without tier 0 completed) ---
+  // Breakeven after tier 0 is handled in Check 1.7 (before trailing stop).
   if (pnlPercent <= STOP_LOSS_PERCENT) {
     logger.warn('Exit decision: STOP LOSS triggered', {
       tradeId: data.tradeId,

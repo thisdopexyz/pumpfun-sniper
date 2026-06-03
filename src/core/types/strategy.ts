@@ -28,7 +28,7 @@ export type SkipReason =
  */
 
 /** Exit reason */
-export type ExitReason = 'TAKE_PROFIT' | 'STOP_LOSS' | 'TRAILING_STOP' | 'TIMEOUT' | 'KILL_SWITCH' | 'MANUAL' | 'GRADUATED' | 'ANTI_RUG' | 'SCALE_OUT' | 'NONE';
+export type ExitReason = 'TAKE_PROFIT' | 'STOP_LOSS' | 'BREAKEVEN_SL' | 'TRAILING_STOP' | 'TIMEOUT' | 'KILL_SWITCH' | 'MANUAL' | 'GRADUATED' | 'ANTI_RUG' | 'SCALE_OUT' | 'NONE';
 
 /**
  * Exit decision result — canonical definition lives in

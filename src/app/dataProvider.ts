@@ -64,6 +64,31 @@ async function getSolPriceWithFallback(oracle: { getSolPriceUsd(): Promise<numbe
 /** In-memory highest price tracking per trade. */
 const highestPriceTracker = new Map<string, bigint>();
 
+/** Get a copy of the highest price tracker for persistence. */
+export function getHighestPricesForPersist(): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const [tradeId, price] of highestPriceTracker) {
+    if (price > 0n) result[tradeId] = price.toString();
+  }
+  return result;
+}
+
+/** Restore highest prices from persisted state (on startup). */
+export function restoreHighestPrices(data: Record<string, string>): void {
+  for (const [tradeId, priceStr] of Object.entries(data)) {
+    try {
+      const price = BigInt(priceStr);
+      if (price > 0n) highestPriceTracker.set(tradeId, price);
+    } catch { /* skip invalid entries */ }
+  }
+}
+
+/** Clean up highest price + graduation ratio tracking for a trade. */
+export function cleanupHighestPriceTracking(tradeId: string): void {
+  highestPriceTracker.delete(tradeId);
+  graduationPriceRatio.delete(tradeId);
+}
+
 /**
  * Graduation price ratio per trade.
  * When a token transitions from BC to Jupiter, the two price systems use
@@ -171,7 +196,10 @@ async function fetchGraduatedPriceLamports(mint: string): Promise<bigint | null>
       if (pair?.priceUsd) {
         const priceUsd = parseFloat(pair.priceUsd);
         if (priceUsd > 0) {
-          const solResp = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
+          const cgCtrl = new AbortController();
+          const cgTimeout = setTimeout(() => cgCtrl.abort(), 5000);
+          const solResp = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', { signal: cgCtrl.signal });
+          clearTimeout(cgTimeout);
           const solData = await solResp.json() as { solana?: { usd?: number } };
           const solPrice = solData?.solana?.usd ?? SOL_FALLBACK_PRICE_USD;
           const priceSol = priceUsd / solPrice;
@@ -438,7 +466,32 @@ export function createDataProvider(
       }
 
       // Calculate seconds since launch for late momentum detection
-      const launchTimestamp = latestLaunch?.timestamp ?? null;
+      // Primary: from persisted launch signal
+      // Fallback: fetch from PumpFun API if signal not yet persisted
+      let launchTimestamp = latestLaunch?.timestamp ?? null;
+      if (launchTimestamp === null) {
+        try {
+          const pfUrl = `https://frontend-api-v3.pump.fun/coins/${mint}`;
+          const pfRes = await fetch(pfUrl, { signal: AbortSignal.timeout(3000) });
+          if (pfRes.ok) {
+            const pfData = await pfRes.json() as { created_timestamp?: number | string };
+            if (pfData.created_timestamp) {
+              launchTimestamp = typeof pfData.created_timestamp === 'string'
+                ? new Date(pfData.created_timestamp).getTime()
+                : pfData.created_timestamp;
+              logger.debug('Launch timestamp from PumpFun API fallback', {
+                mint: mint.slice(0, 12),
+                launchTimestamp,
+              });
+            }
+          }
+        } catch (err: unknown) {
+          logger.debug('PumpFun API fallback failed for launch timestamp', {
+            mint: mint.slice(0, 12),
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
       const secondsSinceLaunch = launchTimestamp !== null
         ? Math.floor((nowMs() - launchTimestamp) / 1000)
         : null;
@@ -563,6 +616,7 @@ export function createDataProvider(
 
       let currentPriceLamports = 0n;
       let graduated = false;
+      let rugPullDetected = false;
       
 
       // Fetch bonding curve account with error handling (RPC can fail)
@@ -578,12 +632,21 @@ export function createDataProvider(
         });
       }
 
+      // BC calibration price — even if graduated, fetch for graduationPriceRatio
+      let bcCalibrationPrice: bigint | null = null;
+
       if (bcAccount?.data && bcAccount.data.length >= 49) {
         const parsed = parseBondingCurveData(bcAccount.data);
         if (parsed) {
           graduated = parsed.complete;
           if (!graduated && parsed.virtualTokenReserves > 0n) {
             currentPriceLamports = computeBondingCurvePriceScaled(parsed.virtualSolReserves, parsed.virtualTokenReserves);
+          }
+          // Always compute BC price for ratio calibration (even if graduated)
+          // BC account persists after graduation — use last BC price to bridge
+          // the 10^6 (BC) vs 10^9 (DexScreener) scaling gap.
+          if (parsed.virtualTokenReserves > 0n) {
+            bcCalibrationPrice = computeBondingCurvePriceScaled(parsed.virtualSolReserves, parsed.virtualTokenReserves);
           }
         } else {
           // Parse failed — bonding curve data is corrupt or format changed.
@@ -649,6 +712,7 @@ export function createDataProvider(
           // RPC succeeded but account is null → bonding curve deleted.
           // This is a strong rug pull signal. Do NOT use prevHighest —
           // let price stay at 0 so stop-loss triggers.
+          rugPullDetected = true;
           logger.error('Bonding curve account GONE (rug pull?) — NOT using prevHighest fallback', {
             mint: pos.mint,
             prevHighest: prevHighest.toString(),
@@ -674,27 +738,32 @@ export function createDataProvider(
         if (existingRatio !== undefined) {
           // Already graduated — apply stored ratio for PNL continuity
           currentPriceLamports = jupiterPrice * existingRatio / 1_000_000_000n;
-        } else if (prevHighest > 0n) {
+        } else if (prevHighest > 0n || bcCalibrationPrice !== null) {
           // First graduation detection — compute and store ratio.
-          // ratio = prevBCPrice / jupiterPrice captures the scale difference
-          // between BC (lamports/raw) and Jupiter (SOL/whole_token).
-          // Jupiter scaled by 10^9, BC by 10^6 → ratio ~10^3 for 6-decimal tokens.
-          // Cap at 10^12 to handle extreme cases while rejecting truly broken values.
-          const ratio = prevHighest * 1_000_000_000n / jupiterPrice;
+          // Use prevHighest if available (BC was polled before graduation),
+          // otherwise fall back to bcCalibrationPrice (BC account still on-chain
+          // but was never polled — e.g., bot started after graduation).
+          // Both are in 10^6 scale (lamports per raw token unit).
+          const refPrice = prevHighest > 0n ? prevHighest : bcCalibrationPrice!;
+          // ratio = refBCPrice * 10^9 / jupiterPrice bridges 10^6 (BC) ↔ 10^9 (DexScreener)
+          const ratio = refPrice * 1_000_000_000n / jupiterPrice;
           if (ratio > 0n && ratio < 1_000_000_000_000n) {
             graduationPriceRatio.set(posTradeId, ratio);
             currentPriceLamports = jupiterPrice * ratio / 1_000_000_000n;
             logger.info('BC→Graduated: PNL continuity ratio computed', {
               mint: pos.mint,
-              lastBCPrice: prevHighest.toString(),
+              lastBCPrice: refPrice.toString(),
+              prevHighest: prevHighest.toString(),
+              bcCalibration: bcCalibrationPrice?.toString() ?? 'null',
               firstJupiterPrice: jupiterPrice.toString(),
               scaledPrice: currentPriceLamports.toString(),
+              ratio: ratio.toString(),
             });
           } else {
             currentPriceLamports = jupiterPrice;
           }
         } else {
-          // No BC price history (e.g., graduated before first poll)
+          // No BC price history at all (BC account deleted) — use raw price
           currentPriceLamports = jupiterPrice;
         }
       }
@@ -704,8 +773,10 @@ export function createDataProvider(
       // use it. A real price crash to exactly 0 is extremely rare (rug pull
       // still has some residual value). Better to use stale price than trigger
       // a false -100% STOP_LOSS.
-      // EXCEPTION: graduated tokens — if price is 0, all sources failed = rug.
-      if (currentPriceLamports === 0n && prevHighest > 0n && !graduated) {
+      // EXCEPTIONS:
+      //   - graduated tokens: if price is 0, all sources failed = rug.
+      //   - rugPullDetected: BC account deleted = real rug, let SL fire.
+      if (currentPriceLamports === 0n && prevHighest > 0n && !graduated && !rugPullDetected) {
         currentPriceLamports = prevHighest;
         logger.warn('Price resolved to 0 but prevHighest exists — using fallback', {
           mint: pos.mint,

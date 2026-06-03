@@ -24,5 +24,8 @@ export const DEFAULT_ANTI_RUG_ENABLED = true as const;
 /** Emergency exit if any top holder dumps > this % of total supply. */
 export const DEFAULT_RUG_DUMP_THRESHOLD_PCT = 10 as const;
 
+/** Emergency exit if ALL top 20 holders combined dump > this % of total supply. */
+export const DEFAULT_RUG_CUMULATIVE_DUMP_THRESHOLD_PCT = 15 as const;
+
 /** How often to poll top holders during an active position (ms). */
 export const DEFAULT_RUG_CHECK_INTERVAL_MS = 5_000 as const;

@@ -50,6 +50,7 @@ import { restoreOpenPositionsFromDb, hasLiveTokenBalance } from './app/positionR
 import { PositionReconciler } from './app/positionReconciler.js';
 import { handleWsMessage } from './ingestion/wsMessageHandler.js';
 import { reclaimAllEmptyAccounts } from './app/execution/rentReclaimer.js';
+import { startSolFloorMonitor } from './app/solFloorMonitor.js';
 import type { TradeRecord } from './core/types/trade.js';
 import { EventRecorder } from './backtest/eventRecorder.js';
 import {
@@ -176,7 +177,7 @@ async function main(): Promise<void> {
   // Create dataProvider now that detectors exist (needs bundle + wash + smartMoney data)
   const antiRugMonitor = new AntiRugMonitor(container.connection);
   dataProvider = createDataProvider(container, positionRegistry, { bundleDetector, washTradeDetector, smartMoneyDetector }, antiRugMonitor);
-  strategy = new FilteredSniperStrategy(dataProvider, executionDelegate, undefined, undefined, container.riskStateRepository);
+  strategy = new FilteredSniperStrategy(dataProvider, executionDelegate, undefined, undefined, container.riskStateRepository, container.maxExposureGuard);
   container.setStrategy(strategy);
 
   // Load persisted scale-out tiers from DB
@@ -416,8 +417,16 @@ async function main(): Promise<void> {
     tradeRepository: container.tradeRepository,
     monitorTrade: (tradeId: string, mint?: string) => strategy.monitorTrade(tradeId, mint),
     monitoredTrades: (strategy as any).monitoredTrades as Set<string>,
+    cleanupMint: (tradeId: string, mint: string) => strategy.cleanupMint(tradeId, mint),
   });
   reconciler.start();
+
+  // Step 5.6: SOL liquidity floor monitor (force sell if SOL in curve < 32)
+  startSolFloorMonitor({
+    container,
+    positionRegistry,
+    executeSell: executionDelegate.executeSell,
+  });
 
   // Step 6: Connect WebSocket (using WsManager with auto-reconnect)
   logger.info('Connecting to Helius WebSocket...');

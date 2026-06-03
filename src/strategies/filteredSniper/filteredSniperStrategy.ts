@@ -38,6 +38,8 @@ import { nowMs } from '../../core/utils/time.js';
 import type { DynamicPositionSizer } from './positionSizer.js';
 import { DEFAULT_EXIT_MONITOR_POLL_MS } from '../../core/constants/defaults/infrastructure.js';
 import type { RiskStateRepository } from '../../storage/repositories/riskStateRepository.js';
+import type { MaxExposureGuard } from '../../risk/exposure/maxExposureGuard.js';
+import { getHighestPricesForPersist, restoreHighestPrices, cleanupHighestPriceTracking } from '../../app/dataProvider.js';
 
 const logger = createLogger('strategy:filteredSniper');
 
@@ -133,6 +135,7 @@ export class FilteredSniperStrategy implements IStrategy {
   private readonly dataProvider: StrategyDataProvider;
   private readonly executionDelegate: StrategyExecutionDelegate;
   private readonly positionSizer: DynamicPositionSizer | null;
+  private readonly maxExposureGuard: MaxExposureGuard | null;
   private state: StrategyState = 'IDLE';
 
   /** Active trade IDs being monitored for exit. */
@@ -146,10 +149,18 @@ export class FilteredSniperStrategy implements IStrategy {
 
   /** Active mints being held (prevents double-buy on restart or re-entry). */
   private readonly activeMints = new Set<string>();
+  /** Trade ID → mint lookup (for cleanup when positionData is null). */
+  private readonly tradeIdToMint = new Map<string, string>();
   /** Mints with a buy currently in-flight (prevents same-mint race condition). */
   private readonly pendingMints = new Set<string>();
   /** Number of buys currently in-flight (between capacity check and registration). */
   private pendingBuyCount = 0;
+  /**
+   * Mutex flag: true while a buy is being evaluated (from onSignal entry to
+   * completion/failure). Prevents setInterval overlap in exit monitor from
+   * allowing 2 concurrent buys past the capacity check.
+   */
+  private buySlotClaimed = false;
   /** Track consecutive sell failures per trade to prevent infinite retry. */
   private readonly sellFailureCounts = new Map<string, number>();
   /** Track stuck positions — skip N cycles before retrying sell. */
@@ -172,6 +183,8 @@ export class FilteredSniperStrategy implements IStrategy {
 
   /** Exit monitoring interval handle. */
   private monitorIntervalHandle: ReturnType<typeof setInterval> | null = null;
+  /** Prevents setInterval callback overlap — if previous tick is still running, skip. */
+  private monitorRunning = false;
 
   /** Exit monitor poll interval in ms. */
   private readonly monitorPollMs: number;
@@ -182,12 +195,14 @@ export class FilteredSniperStrategy implements IStrategy {
     positionSizer?: DynamicPositionSizer,
     monitorPollMs: number = DEFAULT_EXIT_MONITOR_POLL_MS,
     riskStateRepo?: RiskStateRepository,
+    maxExposureGuard?: MaxExposureGuard,
   ) {
     this.dataProvider = dataProvider;
     this.executionDelegate = executionDelegate;
     this.positionSizer = positionSizer ?? null;
     this.monitorPollMs = monitorPollMs;
     this.riskStateRepo = riskStateRepo ?? null;
+    this.maxExposureGuard = maxExposureGuard ?? null;
   }
 
   // -------------------------------------------------------------------------
@@ -232,8 +247,25 @@ export class FilteredSniperStrategy implements IStrategy {
     this.monitoredTrades.add(tradeId);
     if (mint) {
       this.activeMints.add(mint);
+      this.tradeIdToMint.set(tradeId, mint);
     }
     logger.info('Trade added to exit monitor', { tradeId, mint });
+  }
+
+  /**
+   * Clean up strategy-level state for a mint.
+   * Called by reconciler when a manual sell is detected.
+   */
+  cleanupMint(tradeId: string, mint: string): void {
+    this.activeMints.delete(mint);
+    this.tradeIdToMint.delete(tradeId);
+    this.completedScaleOutTiers.delete(tradeId);
+    this.sellFailureCounts.delete(tradeId);
+    this.stuckPositionSkipCounts.delete(tradeId);
+    this.dataProvider.stopAntiRugMonitoring(mint);
+    cleanupHighestPriceTracking(tradeId);
+    void this.persistCompletedTiers();
+    logger.info('Strategy cleanup after reconciled exit', { tradeId, mint });
   }
 
   /**
@@ -261,6 +293,19 @@ export class FilteredSniperStrategy implements IStrategy {
         }
       }
       await this.riskStateRepo.saveState('scale_out_tiers', data);
+
+      // Persist max positions bonus (from tier 0 completions)
+      if (this.maxExposureGuard) {
+        await this.riskStateRepo.saveState('max_positions_bonus', {
+          maxPositions: this.maxExposureGuard.maxConcurrentPositions,
+        });
+      }
+
+      // Persist highest prices (for trailing stop across restarts)
+      const highestPrices = getHighestPricesForPersist();
+      if (Object.keys(highestPrices).length > 0) {
+        await this.riskStateRepo.saveState('highest_prices', highestPrices);
+      }
     } catch (err: unknown) {
       logger.warn('Failed to persist scale-out tiers', {
         error: err instanceof Error ? err.message : String(err),
@@ -283,6 +328,22 @@ export class FilteredSniperStrategy implements IStrategy {
         logger.info('Loaded completed scale-out tiers from DB', {
           tradeCount: Object.keys(data).length,
         });
+      }
+
+      // Restore max positions bonus from persisted state
+      if (this.maxExposureGuard) {
+        const bonus = await this.riskStateRepo.loadState<{ maxPositions: number }>('max_positions_bonus');
+        if (bonus?.maxPositions) {
+          this.maxExposureGuard.setMaxPositions(bonus.maxPositions);
+          logger.info('Restored max positions from DB', { maxPositions: bonus.maxPositions });
+        }
+      }
+
+      // Restore highest prices for trailing stop across restarts
+      const highestPrices = await this.riskStateRepo.loadState<Record<string, string>>('highest_prices');
+      if (highestPrices && Object.keys(highestPrices).length > 0) {
+        restoreHighestPrices(highestPrices);
+        logger.info('Restored highest prices from DB', { count: Object.keys(highestPrices).length });
       }
     } catch (err: unknown) {
       logger.warn('Failed to load scale-out tiers', {
@@ -330,7 +391,8 @@ export class FilteredSniperStrategy implements IStrategy {
     // Guard: check capacity (includes in-flight buys to prevent race condition)
     const activeCount = this.dataProvider.getActivePositionCount();
     const totalCount = activeCount + this.pendingBuyCount;
-    if (totalCount >= MAX_CONCURRENT_POSITIONS) {
+    const effectiveMax = this.maxExposureGuard?.maxConcurrentPositions ?? MAX_CONCURRENT_POSITIONS;
+    if (totalCount >= effectiveMax || this.buySlotClaimed) {
       // Instead of dropping the signal, queue it for when a slot opens.
       // This prevents missing good tokens while holding existing positions.
       if (!this.signalQueue.has(mint) && this.signalQueue.size < FilteredSniperStrategy.SIGNAL_QUEUE_MAX_SIZE) {
@@ -339,7 +401,7 @@ export class FilteredSniperStrategy implements IStrategy {
           mint,
           activeCount,
           pendingBuys: this.pendingBuyCount,
-          max: MAX_CONCURRENT_POSITIONS,
+          max: effectiveMax,
           queueSize: this.signalQueue.size,
         });
       }
@@ -367,6 +429,7 @@ export class FilteredSniperStrategy implements IStrategy {
     // Reserve slot — increment BEFORE any async to prevent race condition
     // where multiple signals pass capacity check before any buy registers.
     this.pendingBuyCount += 1;
+    this.buySlotClaimed = true;
     this.pendingMints.add(mint);
 
     try {
@@ -383,11 +446,12 @@ export class FilteredSniperStrategy implements IStrategy {
           firstFailure: decision.firstFailure,
         });
         this.pendingBuyCount -= 1;
+        this.buySlotClaimed = false;
         this.pendingMints.delete(mint);
         return decision;
       }
 
-      // ALL 16 CHECKS PASSED — execute buy
+      // ALL 21 CHECKS PASSED — execute buy
       // Calculate dynamic position size if sizer available
       let positionSizeUsd: number = POSITION_SIZE_USD;
       if (this.positionSizer !== null) {
@@ -407,7 +471,7 @@ export class FilteredSniperStrategy implements IStrategy {
         });
       }
 
-      logger.info('ALL 16 entry checks passed — executing buy', {
+      logger.info('ALL 21 entry checks passed — executing buy', {
         mint,
         passedCount: decision.passedCount,
         positionSizeUsd,
@@ -424,7 +488,9 @@ export class FilteredSniperStrategy implements IStrategy {
       if (buyResult.success && buyResult.tradeId !== null) {
         this.monitoredTrades.add(buyResult.tradeId);
         this.activeMints.add(mint);
-        this.pendingBuyCount -= 1; // Position now tracked by registry (activeCount)
+        this.tradeIdToMint.set(buyResult.tradeId, mint);
+        this.pendingBuyCount -= 1;
+        this.buySlotClaimed = false; // Position now tracked by registry (activeCount)
         this.pendingMints.delete(mint);
         // Start anti-rug monitoring for this mint
         this.dataProvider.startAntiRugMonitoring(mint);
@@ -436,6 +502,7 @@ export class FilteredSniperStrategy implements IStrategy {
       } else {
         // Buy failed — release reserved slot
         this.pendingBuyCount -= 1;
+        this.buySlotClaimed = false;
         this.pendingMints.delete(mint);
         if (isExpectedBuyBlock(buyResult.error)) {
           logger.warn('Buy skipped by risk guard', {
@@ -454,6 +521,7 @@ export class FilteredSniperStrategy implements IStrategy {
     } catch (err: unknown) {
       // Unexpected error — release reserved slot
       this.pendingBuyCount -= 1;
+        this.buySlotClaimed = false;
       this.pendingMints.delete(mint);
       throw err;
     }
@@ -477,9 +545,19 @@ export class FilteredSniperStrategy implements IStrategy {
       // Trade no longer exists — remove from monitoring
       this.monitoredTrades.delete(tradeId);
       this.completedScaleOutTiers.delete(tradeId);
+      this.sellFailureCounts.delete(tradeId);
+      this.stuckPositionSkipCounts.delete(tradeId);
+      // Clean up activeMints using tradeId→mint lookup
+      const mint = this.tradeIdToMint.get(tradeId);
+      if (mint) {
+        this.activeMints.delete(mint);
+        this.tradeIdToMint.delete(tradeId);
+        this.dataProvider.stopAntiRugMonitoring(mint);
+        logger.info('Position no longer exists — cleaned up mint', { tradeId, mint });
+      } else {
+        logger.info('Position no longer exists — removed from monitoring', { tradeId });
+      }
       void this.persistCompletedTiers(); // Cleanup persisted state
-      // Mint cleanup: we don't know the mint here, but it will be cleaned
-      // when the position exit is detected below
       return;
     }
 
@@ -528,20 +606,32 @@ export class FilteredSniperStrategy implements IStrategy {
           if (tierIndex >= 0) {
             completed.add(tierIndex);
             this.completedScaleOutTiers.set(tradeId, completed);
-            void this.persistCompletedTiers(); // Persist to survive restart
+            this.sellFailureCounts.delete(tradeId); // Reset failures — fresh start for next tier
+            await this.persistCompletedTiers(); // MUST await — crash safety for tier recovery
+
+            // After tier 0 (+100% sell 50%): unlock +1 concurrent position
+            // Capital is now freer — we've recouped half the position
+            if (tierIndex === 0 && this.maxExposureGuard) {
+              this.maxExposureGuard.addMaxPositions(1);
+              logger.info('Tier 0 complete — unlocked +1 max position', {
+                tradeId,
+                newMax: this.maxExposureGuard.maxConcurrentPositions,
+              });
+            }
           }
 
           // Check if ALL tiers are completed
           const tiersNeeded = SCALE_OUT_TIERS.length;
           if (completed && completed.size >= tiersNeeded) {
             // All scale-out tiers done — but DON'T mark as full exit yet!
-            // 31.875% of position still rides with trailing stop / SL / TP.
+            // 40% of position still rides with trailing stop / SL / TP.
+            // (50% sold at tier 0, 10% at tier 1, remaining 40%)
             // Keep monitoring so trailing stop can lock remaining profits.
             this.dataProvider.transitionPosition(tradeId, 'SCALE_OUT_PARTIAL', 'SCALE_OUT_ALL_TIERS');
             this.monitoredTrades.add(tradeId);
             logger.info('All scale-out tiers complete — remaining position rides trailing stop', {
               tradeId,
-              remainingPct: '31.875%',
+              remainingPct: '40%',
               completedTiers: completed.size,
               totalTiers: tiersNeeded,
             });
@@ -561,11 +651,25 @@ export class FilteredSniperStrategy implements IStrategy {
         } else {
           // Full exit — remove mint from active tracking
           this.activeMints.delete(positionData.mint);
+          this.tradeIdToMint.delete(tradeId);
           // Stop anti-rug monitoring and clear triggered flag
           this.dataProvider.stopAntiRugMonitoring(positionData.mint);
+          // Check if this position had tier 0 BEFORE deleting (needed for max positions reclaim)
+          const hadTier0 = this.completedScaleOutTiers.get(tradeId)?.has(0) ?? false;
           this.completedScaleOutTiers.delete(tradeId);
           this.sellFailureCounts.delete(tradeId);
+          this.stuckPositionSkipCounts.delete(tradeId);
           void this.persistCompletedTiers(); // Cleanup persisted state
+
+          // Reclaim +1 max position ONLY if tier 0 was actually completed
+          if (hadTier0 && this.maxExposureGuard) {
+            this.maxExposureGuard.removeMaxPositions(1);
+            logger.info('Full exit — reclaimed +1 max position (tier 0 was completed)', {
+              tradeId,
+              newMax: this.maxExposureGuard.maxConcurrentPositions,
+            });
+          }
+
           logger.info('Exit executed successfully', {
             tradeId,
             reason: exitDecision.reason,
@@ -613,6 +717,8 @@ export class FilteredSniperStrategy implements IStrategy {
     this.monitorIntervalHandle = setInterval(async () => {
       try {
         if (this.state !== 'RUNNING') return;
+        if (this.monitorRunning) return; // Skip if previous tick still running
+        this.monitorRunning = true;
 
         // Process queued signals if a slot is available
         await this.processSignalQueue();
@@ -645,6 +751,8 @@ export class FilteredSniperStrategy implements IStrategy {
         logger.error('Exit monitor top-level error', {
           err: err instanceof Error ? err.message : String(err),
         });
+      } finally {
+        this.monitorRunning = false;
       }
     }, this.monitorPollMs);
   }
@@ -657,7 +765,8 @@ export class FilteredSniperStrategy implements IStrategy {
     if (this.signalQueue.size === 0) return;
 
     const activeCount = this.dataProvider.getActivePositionCount();
-    if (activeCount + this.pendingBuyCount >= MAX_CONCURRENT_POSITIONS) return;
+    const effectiveMax = this.maxExposureGuard?.maxConcurrentPositions ?? MAX_CONCURRENT_POSITIONS;
+    if (activeCount + this.pendingBuyCount >= effectiveMax || this.buySlotClaimed) return;
 
     const now = nowMs();
 

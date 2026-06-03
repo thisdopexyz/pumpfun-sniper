@@ -19,6 +19,7 @@ import { Connection, PublicKey } from '@solana/web3.js';
 import {
   DEFAULT_ANTI_RUG_ENABLED,
   DEFAULT_RUG_DUMP_THRESHOLD_PCT,
+  DEFAULT_RUG_CUMULATIVE_DUMP_THRESHOLD_PCT,
   DEFAULT_RUG_CHECK_INTERVAL_MS,
 } from '../../core/constants/defaults.js';
 import { createLogger } from '../../telemetry/logging/logger.js';
@@ -44,8 +45,10 @@ interface MintMonitorState {
 export interface AntiRugConfig {
   /** Whether the monitor is enabled. Default: true. */
   readonly enabled?: boolean;
-  /** Emergency exit threshold — dump > this % of total supply. Default: 10. */
+  /** Emergency exit — single holder dump > this % of total supply. Default: 10. */
   readonly thresholdPct?: number;
+  /** Emergency exit — ALL top holders combined dump > this % of total supply. Default: 15. */
+  readonly cumulativeDumpThresholdPct?: number;
   /** Polling interval in ms. Default: 5000. */
   readonly checkIntervalMs?: number;
 }
@@ -61,6 +64,7 @@ export class AntiRugMonitor {
   private readonly connection: Connection;
   private readonly enabled: boolean;
   private readonly thresholdPct: number;
+  private readonly cumulativeDumpThresholdPct: number;
   private readonly checkIntervalMs: number;
 
   /** Active monitoring state per mint. */
@@ -70,6 +74,7 @@ export class AntiRugMonitor {
     this.connection = connection;
     this.enabled = config?.enabled ?? DEFAULT_ANTI_RUG_ENABLED;
     this.thresholdPct = config?.thresholdPct ?? DEFAULT_RUG_DUMP_THRESHOLD_PCT;
+    this.cumulativeDumpThresholdPct = config?.cumulativeDumpThresholdPct ?? DEFAULT_RUG_CUMULATIVE_DUMP_THRESHOLD_PCT;
     this.checkIntervalMs = config?.checkIntervalMs ?? DEFAULT_RUG_CHECK_INTERVAL_MS;
   }
 
@@ -91,6 +96,7 @@ export class AntiRugMonitor {
     logger.info('Starting anti-rug monitoring', {
       mint,
       thresholdPct: this.thresholdPct,
+      cumulativeDumpThresholdPct: this.cumulativeDumpThresholdPct,
       checkIntervalMs: this.checkIntervalMs,
     });
 
@@ -202,6 +208,8 @@ export class AntiRugMonitor {
       // If we have a previous snapshot, compare balances
       if (state.lastSnapshot.size > 0 && state.lastTotalSupply > 0n) {
         const dumpThreshold = (state.lastTotalSupply * BigInt(this.thresholdPct)) / 100n;
+        const cumulativeThreshold = (state.lastTotalSupply * BigInt(this.cumulativeDumpThresholdPct)) / 100n;
+        let totalDecrease = 0n;
 
         for (const [address, currentBalance] of currentSnapshot) {
           const previousBalance = state.lastSnapshot.get(address);
@@ -211,13 +219,18 @@ export class AntiRugMonitor {
           }
 
           const decrease = previousBalance - currentBalance;
+          if (decrease > 0n) {
+            totalDecrease += decrease;
+          }
+
+          // Check 1: Single holder dump > threshold
           if (decrease > dumpThreshold) {
             const decreasePct = Number((decrease * 10000n) / state.lastTotalSupply) / 100;
             const details =
               `Top holder ${address.slice(0, 8)}... dumped ${decreasePct.toFixed(2)}% of supply ` +
               `(${decrease.toString()} tokens, threshold: ${this.thresholdPct}%)`;
 
-            logger.warn('ANTI-RUG DETECTED', {
+            logger.warn('ANTI-RUG DETECTED (single holder dump)', {
               mint,
               address: address.slice(0, 12),
               decreaseTokens: decrease.toString(),
@@ -232,6 +245,26 @@ export class AntiRugMonitor {
             onRugDetected(mint, details);
             return;
           }
+        }
+
+        // Check 2: Cumulative dump from ALL top holders > threshold
+        if (totalDecrease > cumulativeThreshold) {
+          const totalDecreasePct = Number((totalDecrease * 10000n) / state.lastTotalSupply) / 100;
+          const details =
+            `Top 20 holders cumulatively dumped ${totalDecreasePct.toFixed(2)}% of supply ` +
+            `(${totalDecrease.toString()} tokens, cumulative threshold: ${this.cumulativeDumpThresholdPct}%)`;
+
+          logger.warn('ANTI-RUG DETECTED (cumulative dump)', {
+            mint,
+            totalDecreaseTokens: totalDecrease.toString(),
+            totalDecreasePct: totalDecreasePct.toFixed(2),
+            cumulativeThresholdPct: this.cumulativeDumpThresholdPct,
+            holderCount: currentSnapshot.size,
+          });
+
+          this.stopMonitoring(mint);
+          onRugDetected(mint, details);
+          return;
         }
       }
 
