@@ -12,17 +12,17 @@
 // Position sizing
 // ---------------------------------------------------------------------------
 
-/** Position sizing — base $0.12 equivalent (used directly by strategy) */
-export const DEFAULT_POSITION_SIZE_USD = 0.12 as const;
+/** Position sizing — base $1.00 equivalent (used directly by strategy) */
+export const DEFAULT_POSITION_SIZE_USD = 1.0 as const;
 
-/** Dynamic position sizing — minimum $0.12 */
-export const DEFAULT_MIN_POSITION_SIZE_USD = 0.12 as const;
+/** Dynamic position sizing — minimum $1.00 */
+export const DEFAULT_MIN_POSITION_SIZE_USD = 1.0 as const;
 
-/** Dynamic position sizing — maximum $0.12 */
-export const DEFAULT_MAX_POSITION_SIZE_USD = 0.12 as const;
+/** Dynamic position sizing — maximum $1.00 */
+export const DEFAULT_MAX_POSITION_SIZE_USD = 1.0 as const;
 
-/** Dynamic position sizing — base (center) $0.12 */
-export const DEFAULT_BASE_POSITION_SIZE_USD = 0.12 as const;
+/** Dynamic position sizing — base (center) $1.00 */
+export const DEFAULT_BASE_POSITION_SIZE_USD = 1.0 as const;
 
 // ---------------------------------------------------------------------------
 // Take profit / Stop loss / Trailing
