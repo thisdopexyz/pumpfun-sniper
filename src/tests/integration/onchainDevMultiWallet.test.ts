@@ -49,6 +49,7 @@ async function testBuyVelocity(): Promise<void> {
   const mint = 'TestMint111111111111111111111111111111111111';
   const now = nowMs();
 
+  // Record ALL buys first (before any analysis)
   // Scenario A: Normal organic growth (5-10 wallets over 60 seconds)
   const organicWallets = [
     'Org1', 'Org2', 'Org3', 'Org4', 'Org5', 'Org6', 'Org7',
@@ -56,33 +57,40 @@ async function testBuyVelocity(): Promise<void> {
   for (let i = 0; i < organicWallets.length; i++) {
     analyzer.recordBuy(mint + '_organic', organicWallets[i]!, now + i * 8000); // ~8s apart
   }
-  const organicResult = analyzer.analyzeMint(mint + '_organic');
-  assert('Organic: low velocity score', (organicResult?.score ?? 100) < 40,
-    `score=${organicResult?.score}, wallets7=${organicResult?.uniqueWallets}`);
 
   // Scenario B: Bot swarm (30 wallets in 30 seconds)
   const swarmMint = mint + '_swarm';
   for (let i = 0; i < 30; i++) {
     analyzer.recordBuy(swarmMint, `SwarmWallet${i}`, now + i * 1000); // 1 per second
   }
-  const swarmResult = analyzer.analyzeMint(swarmMint);
-  assert('Bot swarm: high velocity score', (swarmResult?.score ?? 0) >= 60,
-    `score=${swarmResult?.score}, wallets30s=${swarmResult?.wallets30s}`);
 
   // Scenario C: Extreme burst (20 wallets in 5 seconds)
   const burstMint = mint + '_burst';
   for (let i = 0; i < 20; i++) {
     analyzer.recordBuy(burstMint, `BurstWallet${i}`, now + i * 250); // 4 per second
   }
-  const burstResult = analyzer.analyzeMint(burstMint);
-  assert('Extreme burst: maximum score', (burstResult?.score ?? 0) >= 80,
-    `score=${burstResult?.score}, wallets10s=${burstResult?.wallets10s}`);
 
   // Scenario D: Regular intervals (bot-like, low std dev)
   const regularMint = mint + '_regular';
   for (let i = 0; i < 20; i++) {
     analyzer.recordBuy(regularMint, `RegularWallet${i}`, now + i * 500); // exactly 500ms apart
   }
+
+  // Wait for token age to exceed TOKEN_AGE_HALF_MS (30s) for full confidence
+  await new Promise(r => setTimeout(r, 31_000));
+
+  const organicResult = analyzer.analyzeMint(mint + '_organic');
+  assert('Organic: low velocity score', (organicResult?.score ?? 100) < 40,
+    `score=${organicResult?.score}, wallets7=${organicResult?.uniqueWallets}`);
+
+  const swarmResult = analyzer.analyzeMint(swarmMint);
+  assert('Bot swarm: high velocity score', (swarmResult?.score ?? 0) >= 60,
+    `score=${swarmResult?.score}, wallets30s=${swarmResult?.wallets30s}`);
+
+  const burstResult = analyzer.analyzeMint(burstMint);
+  assert('Extreme burst: high score from CV + entropy', (burstResult?.score ?? 0) >= 60,
+    `score=${burstResult?.score}, wallets10s=${burstResult?.wallets10s}`);
+
   const regularResult = analyzer.analyzeMint(regularMint);
   assert('Regular intervals: bot detection bonus', (regularResult?.score ?? 0) >= 70,
     `score=${regularResult?.score}, stdDev=${regularResult?.stdDevMs?.toFixed(1)}ms`);

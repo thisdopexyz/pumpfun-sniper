@@ -334,9 +334,10 @@ export class WalletAgeDetector implements IDetector {
     // If creator is new (<1 hour) AND buyers are new → high combined score
     let combinedScore: number;
     if (creatorAgeMs === null) {
-      // Creator age unknown (RPC not resolved yet) → HARD BLOCK
-      // Can't assess creator risk → must wait for resolution
-      combinedScore = 100;
+      // Creator age unknown (RPC not resolved yet) → SKIP (don't block, don't penalize)
+      // Other filters (bundle, velocity, holder count) will catch scams
+      // This prevents blocking ALL tokens due to RPC latency
+      combinedScore = 0;
     } else if (creatorAgeMs >= AGE_7_DAYS_MS) {
       // Creator established (>7 days) → buyer score heavily discounted
       // Max combined score = 30 (buyer score * 0.3)
