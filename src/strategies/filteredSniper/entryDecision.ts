@@ -1,10 +1,10 @@
 /**
  * Entry Decision
  *
- * Evaluates ALL 21 entry checks from rule.md before allowing a buy.
+ * Evaluates ALL 26 entry checks from rule.md before allowing a buy.
  * Every single check must pass. No shortcuts. No partial passes.
  *
- * The 21 checks (from rule.md):
+ * The 26 checks (from rule.md):
  *   1. Launch detected
  *   2. Creator not blacklisted
  *   3. Creator history acceptable
@@ -54,6 +54,7 @@ import {
   MAX_BUY_VELOCITY_SCORE,
   MAX_ENHANCED_BUNDLE_PCT,
   MAX_CROSS_TOKEN_SCORE,
+  MIN_TOKEN_AGE_SECONDS,
 } from './filteredSniperRules.js';
 import { createLogger } from '../../telemetry/logging/logger.js';
 import { Counter } from 'prom-client';
@@ -76,7 +77,7 @@ const entryRejectionCounter = new Counter({
 // Types
 // ---------------------------------------------------------------------------
 
-/** Data required for all 25 entry checks. */
+/** Data required for all 26 entry checks. */
 export interface EntryCheckData {
   readonly mint: MintAddress;
 
@@ -174,9 +175,9 @@ interface CheckResult {
 
 /** Entry decision result. */
 export interface EntryDecisionResult {
-  /** Whether ALL 19 checks passed. */
+  /** Whether ALL 26 checks passed. */
   readonly allowed: boolean;
-  /** Individual check results (always 19). */
+  /** Individual check results (always 26). */
   readonly checks: readonly CheckResult[];
   /** Number of checks that passed. */
   readonly passedCount: number;
@@ -205,7 +206,7 @@ export interface EntryDecisionResult {
 // ---------------------------------------------------------------------------
 
 /**
- * Evaluate all 19 entry checks. ALL must pass.
+ * Evaluate all 26 entry checks. ALL must pass.
  *
  * Returns immediately on first failure for speed, but still reports
  * all check results for logging/telemetry.
@@ -471,6 +472,24 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
       };
     })(),
 
+    // Check 20: Minimum token age (avoid bot chaos zone)
+    // Tokens in the first N seconds are the most volatile and bot-infested
+    // BLOCK if too fresh — let the chaos settle before entering
+    // PASS if age unknown (secondsSinceLaunch may not be available for all signal types)
+    (() => {
+      if (data.secondsSinceLaunch == null) {
+        return { name: 'min_token_age', passed: true, reason: 'Token age data unavailable — passing (non-launch signal)' };
+      }
+      const passed = data.secondsSinceLaunch >= MIN_TOKEN_AGE_SECONDS;
+      return {
+        name: 'min_token_age',
+        passed,
+        reason: passed
+          ? `Token age OK: ${data.secondsSinceLaunch.toFixed(0)}s (min ${MIN_TOKEN_AGE_SECONDS}s)`
+          : `TOKEN TOO FRESH: ${data.secondsSinceLaunch.toFixed(0)}s old (min ${MIN_TOKEN_AGE_SECONDS}s) — bot chaos zone, waiting for stability`,
+      };
+    })(),
+
     // Check 21: Maximum buy market cap (avoid already-pumped tokens)
     // BLOCK if mcap exceeds threshold — diminishing returns for small positions
     // BLOCK if data unavailable — can't assess risk without mcap data
@@ -593,7 +612,7 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
     })(),
   ];
 
-  // Validate we have exactly 23 checks (compile-time safety)
+  // Validate check count matches ENTRY_CHECK_COUNT
   if (checks.length !== ENTRY_CHECK_COUNT) {
     throw new Error(
       `Entry check count mismatch: expected ${ENTRY_CHECK_COUNT}, got ${checks.length}`,

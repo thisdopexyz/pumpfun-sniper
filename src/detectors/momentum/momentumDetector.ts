@@ -246,7 +246,8 @@ export class MomentumDetector implements IDetector {
         const now = nowMs();
         if (now - state.lastSignalAt >= this.cooldownMs) {
           state.lastSignalAt = now;
-          const sellCount = state.sells.filter(s => s.timestamp >= nowMs() - SELL_PRESSURE_WINDOW_SECONDS * 1000).length;
+          // Use SAME window for sells as buys to avoid ratio inflation
+          const sellCount = state.sells.filter(s => s.timestamp >= nowMs() - this.windowMs).length;
           this.emitMomentumSignal(event.mint, buyCount, totalVolume, event.slot, uniqueSlotCount, uniqueWalletCount, sellCount);
         }
       }

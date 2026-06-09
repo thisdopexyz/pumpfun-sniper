@@ -76,8 +76,8 @@ async function testBuyVelocity(): Promise<void> {
     analyzer.recordBuy(regularMint, `RegularWallet${i}`, now + i * 500); // exactly 500ms apart
   }
 
-  // Wait for token age to exceed TOKEN_AGE_HALF_MS (30s) for full confidence
-  await new Promise(r => setTimeout(r, 31_000));
+  // Wait for token age to exceed TOKEN_AGE_HALF_MS (15s) for full confidence
+  await new Promise(r => setTimeout(r, 16_000));
 
   const organicResult = analyzer.analyzeMint(mint + '_organic');
   assert('Organic: low velocity score', (organicResult?.score ?? 100) < 40,

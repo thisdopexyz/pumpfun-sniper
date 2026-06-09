@@ -90,11 +90,11 @@ const COOLDOWN_MS = 120_000;
 //   15-30s → half confidence
 //   > 30s → full confidence
 
-/** Skip entirely for tokens younger than this */
-const TOKEN_AGE_SKIP_MS = 15_000;
+/** Skip entirely for tokens younger than this — need minimum data for analysis */
+const TOKEN_AGE_SKIP_MS = 5_000;
 
 /** Half confidence for tokens between SKIP and this */
-const TOKEN_AGE_HALF_MS = 30_000;
+const TOKEN_AGE_HALF_MS = 15_000;
 
 /** Minimum buys for meaningful analysis */
 const MIN_BUYS_FOR_ANALYSIS = 8;

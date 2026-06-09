@@ -91,12 +91,18 @@ function passingEntryData(overrides: Partial<EntryCheckData> = {}): EntryCheckDa
     priceImpactBps: 100, // 1% — within limit
     bundlePct: 10,
     washTradeScore: 20,
-    uniqueWallets: 15,
+    uniqueWallets: 25,
     sellCountInWindow: 3,
     realSolReservesLamports: 1_000_000_000n,
     holderCount: 50,
-    marketCapUsd: 50000,
+    marketCapUsd: 15000,
     volumeUsd: 5000,
+    smartMoneyScore: 0,
+    smartWalletCount: 0,
+    walletAgeScore: 20,
+    buyVelocityScore: 10,
+    enhancedBundlePct: 10,
+    crossTokenScore: 0,
     ...overrides,
   };
 }

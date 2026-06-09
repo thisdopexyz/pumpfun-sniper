@@ -27,7 +27,7 @@ function makeBaseData(overrides: Partial<EntryCheckData> = {}): EntryCheckData {
     sellCountInWindow: 0,
     realSolReservesLamports: 2_000_000_000n,
     holderCount: 80,
-    secondsSinceLaunch: 120,
+    secondsSinceLaunch: 1800,
     marketCapUsd: 15000,
     ...overrides,
   };
@@ -50,9 +50,9 @@ describe('Sell pressure (Check 14) — ratio', () => {
     expect(c!.passed).toBe(true);
   });
 
-  it('All 19 checks present', () => {
+  it('All 26 checks present', () => {
     const data = makeBaseData();
     const result = evaluateEntry(data);
-    expect(result.checks.length).toBe(19);
+    expect(result.checks.length).toBe(26);
   });
 });

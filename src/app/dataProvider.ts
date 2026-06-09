@@ -551,6 +551,10 @@ export function createDataProvider(
         marketCapUsd,
       });
 
+      // Cache bundle result — same detector for checks 11 and 26
+      // Calling once guarantees snapshot consistency (fixes issue #5 and #10)
+      const bundlePctCached = detectors?.bundleDetector?.forceAnalyze(mint as any) ?? null;
+
       return {
         mint,
         launchDetected,
@@ -566,7 +570,7 @@ export function createDataProvider(
         volumeLamports,
         windowMs,
         priceImpactBps,
-        bundlePct: detectors?.bundleDetector?.forceAnalyze(mint as any) ?? null,
+        bundlePct: bundlePctCached,
         washTradeScore: detectors?.washTradeDetector?.forceAnalyze(mint) ?? null,
         uniqueWallets: signal.type === 'MOMENTUM' ? (signal as MomentumSignal).uniqueWalletCount : undefined,
         // Check 14: Sell pressure — now available from momentum signal
@@ -598,8 +602,8 @@ export function createDataProvider(
         walletAgeScore: detectors?.walletAgeDetector?.forceAnalyze(mint as any) ?? null,
         // Check 25: Buy velocity score (Dev Multi-Wallet Defense)
         buyVelocityScore: detectors?.buyVelocityAnalyzer?.forceAnalyze(mint as any) ?? null,
-        // Check 26: Enhanced bundle percentage (uses same detector as Check 11, but with stricter threshold)
-        enhancedBundlePct: detectors?.bundleDetector?.forceAnalyze(mint as any) ?? null,
+        // Check 26: Reuse cached bundlePct — same value, snapshot consistency
+        enhancedBundlePct: bundlePctCached,
         // Check 27: Cross-token correlation score (Dev Multi-Wallet Defense)
         crossTokenScore: detectors?.crossTokenCorrelator?.forceAnalyze(mint as any) ?? null,
       };

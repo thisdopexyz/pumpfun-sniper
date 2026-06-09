@@ -30,7 +30,7 @@ function makeData(overrides: Partial<EntryCheckData> = {}): EntryCheckData {
     sellCountInWindow: 0,
     realSolReservesLamports: 2_000_000_000n,
     holderCount: 80,
-    secondsSinceLaunch: 120,
+    secondsSinceLaunch: 1800,
     marketCapUsd: 15000,
     ...overrides,
   };
@@ -109,8 +109,8 @@ describe('Sell pressure — ratio (60% threshold, 30s buy / 60s sell)', () => {
     expect(c!.passed).toBe(false);
   });
 
-  it('All 19 checks present', () => {
+  it('All 26 checks present', () => {
     const r = evaluateEntry(makeData());
-    expect(r.checks.length).toBe(19);
+    expect(r.checks.length).toBe(26);
   });
 });

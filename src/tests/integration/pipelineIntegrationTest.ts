@@ -190,17 +190,23 @@ export function createPassingEntryData(mint: MintAddress): EntryCheckData {
     liquiditySane: true,
     walletConcentrationAcceptable: true,
     buyCountInWindow: MOMENTUM_MIN_BUYS,
-    volumeLamports: 2_000_000_000n,
+    volumeLamports: 15_000_000_000n,
     windowMs: MOMENTUM_WINDOW_SECONDS * 1000,
     priceImpactBps: 100, // 1% — within limit
     bundlePct: 10,
     washTradeScore: 20,
-    uniqueWallets: 15,
+    uniqueWallets: 25,
     sellCountInWindow: 3,
     realSolReservesLamports: 1_000_000_000n,
     holderCount: 50,
-    marketCapUsd: 50000,
+    marketCapUsd: 15000,
     volumeUsd: 5000,
+    smartMoneyScore: 0,
+    smartWalletCount: 0,
+    walletAgeScore: 20,
+    buyVelocityScore: 10,
+    enhancedBundlePct: 10,
+    crossTokenScore: 0,
   };
 }
 
