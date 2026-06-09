@@ -204,8 +204,8 @@ async function testEntryDecision(): Promise<void> {
     enhancedBundlePct: 10, // Low = no bundling
     crossTokenScore: 0,    // Zero = no serial scammer wallets
   });
-  assert('Clean token: all 26 checks pass', cleanResult.allowed,
-    `passed=${cleanResult.passedCount}/27, failed=${cleanResult.failedCount}`);
+  assert('Clean token: all 25 checks pass', cleanResult.allowed,
+    `passed=${cleanResult.passedCount}/25, failed=${cleanResult.failedCount}`);
 
   // Scenario B: Wallet age check blocks (dev multi-wallet)
   const newWalletsResult = evaluateEntry({

@@ -1,10 +1,10 @@
 /**
  * Entry Decision
  *
- * Evaluates ALL 26 entry checks from rule.md before allowing a buy.
+ * Evaluates ALL 25 entry checks from rule.md before allowing a buy.
  * Every single check must pass. No shortcuts. No partial passes.
  *
- * The 26 checks (from rule.md):
+ * The 25 checks (from rule.md):
  *   1. Launch detected
  *   2. Creator not blacklisted
  *   3. Creator history acceptable
@@ -54,7 +54,6 @@ import {
   MAX_BUY_VELOCITY_SCORE,
   MAX_ENHANCED_BUNDLE_PCT,
   MAX_CROSS_TOKEN_SCORE,
-  MIN_TOKEN_AGE_SECONDS,
 } from './filteredSniperRules.js';
 import { createLogger } from '../../telemetry/logging/logger.js';
 import { Counter } from 'prom-client';
@@ -77,7 +76,7 @@ const entryRejectionCounter = new Counter({
 // Types
 // ---------------------------------------------------------------------------
 
-/** Data required for all 26 entry checks. */
+/** Data required for all 25 entry checks. */
 export interface EntryCheckData {
   readonly mint: MintAddress;
 
@@ -175,9 +174,9 @@ interface CheckResult {
 
 /** Entry decision result. */
 export interface EntryDecisionResult {
-  /** Whether ALL 26 checks passed. */
+  /** Whether ALL 25 checks passed. */
   readonly allowed: boolean;
-  /** Individual check results (always 26). */
+  /** Individual check results (always 25). */
   readonly checks: readonly CheckResult[];
   /** Number of checks that passed. */
   readonly passedCount: number;
@@ -206,7 +205,7 @@ export interface EntryDecisionResult {
 // ---------------------------------------------------------------------------
 
 /**
- * Evaluate all 26 entry checks. ALL must pass.
+ * Evaluate all 25 entry checks. ALL must pass.
  *
  * Returns immediately on first failure for speed, but still reports
  * all check results for logging/telemetry.
@@ -469,24 +468,6 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
         reason: detected
           ? `SMART MONEY DETECTED: score ${(data.smartMoneyScore ?? 0).toFixed(3)}, ${data.smartWalletCount ?? 0} wallets`
           : `No smart money: score ${(data.smartMoneyScore ?? 0).toFixed(3)}`,
-      };
-    })(),
-
-    // Check 20: Minimum token age (avoid bot chaos zone)
-    // Tokens in the first N seconds are the most volatile and bot-infested
-    // BLOCK if too fresh — let the chaos settle before entering
-    // PASS if age unknown (secondsSinceLaunch may not be available for all signal types)
-    (() => {
-      if (data.secondsSinceLaunch == null) {
-        return { name: 'min_token_age', passed: true, reason: 'Token age data unavailable — passing (non-launch signal)' };
-      }
-      const passed = data.secondsSinceLaunch >= MIN_TOKEN_AGE_SECONDS;
-      return {
-        name: 'min_token_age',
-        passed,
-        reason: passed
-          ? `Token age OK: ${data.secondsSinceLaunch.toFixed(0)}s (min ${MIN_TOKEN_AGE_SECONDS}s)`
-          : `TOKEN TOO FRESH: ${data.secondsSinceLaunch.toFixed(0)}s old (min ${MIN_TOKEN_AGE_SECONDS}s) — bot chaos zone, waiting for stability`,
       };
     })(),
 
