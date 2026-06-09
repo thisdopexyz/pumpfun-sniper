@@ -69,6 +69,12 @@ function reconstructSignal(row: SignalRow): Signal {
       return { ...base, ...data } as SmartMoneySignal;
     case 'REVOKE':
       return { ...base, ...data } as RevokeSignal;
+    case 'WALLET_AGE':
+      return { ...base, ...data } as import('../../core/types/signal.js').WalletAgeSignal;
+    case 'BUY_VELOCITY':
+      return { ...base, ...data } as import('../../core/types/signal.js').BuyVelocitySignal;
+    case 'CROSS_TOKEN':
+      return { ...base, ...data } as import('../../core/types/signal.js').CrossTokenSignal;
     default: {
       const _exhaustive: never = base.type;
       throw new Error(`Unknown signal type: ${_exhaustive as string}`);

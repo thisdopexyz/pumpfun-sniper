@@ -245,7 +245,7 @@ function deriveMetadataPDA(mint: PublicKey): PublicKey {
 export function createDataProvider(
   container: ServiceContainer,
   positionRegistry: PositionRegistry,
-  detectors?: { bundleDetector?: { getLatestBundlePct(mint: string): number | null; forceAnalyze(mint: string): number | null }; washTradeDetector?: { getLatestWashScore(mint: string): number | null; forceAnalyze(mint: string): number | null }; smartMoneyDetector?: { checkSmartMoney(mint: string): { smartMoneyScore: number; smartWalletCount: number } | null } },
+  detectors?: { bundleDetector?: { getLatestBundlePct(mint: string): number | null; forceAnalyze(mint: string): number | null }; washTradeDetector?: { getLatestWashScore(mint: string): number | null; forceAnalyze(mint: string): number | null }; smartMoneyDetector?: { checkSmartMoney(mint: string): { smartMoneyScore: number; smartWalletCount: number } | null }; walletAgeDetector?: { getLatestScore(mint: string): number | null; forceAnalyze(mint: string): number | null }; buyVelocityAnalyzer?: { getLatestScore(mint: string): number | null; forceAnalyze(mint: string): number | null }; crossTokenCorrelator?: { getLatestScore(mint: string): number | null; forceAnalyze(mint: string): number | null } },
   antiRugMonitor?: AntiRugMonitor,
 ): StrategyDataProvider {
   const conn = container.connection;
@@ -594,6 +594,14 @@ export function createDataProvider(
             return { smartMoneyScore: sm?.smartMoneyScore ?? null, smartWalletCount: sm?.smartWalletCount ?? 0 };
           } catch { return { smartMoneyScore: null, smartWalletCount: 0 }; }
         })(),
+        // Check 24: Wallet age score (Dev Multi-Wallet Defense)
+        walletAgeScore: detectors?.walletAgeDetector?.forceAnalyze(mint as any) ?? null,
+        // Check 25: Buy velocity score (Dev Multi-Wallet Defense)
+        buyVelocityScore: detectors?.buyVelocityAnalyzer?.forceAnalyze(mint as any) ?? null,
+        // Check 26: Enhanced bundle percentage (uses same detector as Check 11, but with stricter threshold)
+        enhancedBundlePct: detectors?.bundleDetector?.forceAnalyze(mint as any) ?? null,
+        // Check 27: Cross-token correlation score (Dev Multi-Wallet Defense)
+        crossTokenScore: detectors?.crossTokenCorrelator?.forceAnalyze(mint as any) ?? null,
       };
     },
 

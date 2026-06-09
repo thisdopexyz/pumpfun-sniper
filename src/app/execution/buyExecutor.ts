@@ -391,6 +391,7 @@ export async function executeBuy(params: BuyParams, runtime: ExecutionRuntime): 
               submittedAt: Date.now(),
               confirmedAt: Date.now(),
               failureReason: null,
+              exitReason: null,
             });
           } catch (saveErr: unknown) {
             logger.error('Failed to save BonkFun buy trade', {
@@ -424,8 +425,16 @@ export async function executeBuy(params: BuyParams, runtime: ExecutionRuntime): 
           submittedAt: Date.now(),
           confirmedAt: null,
           failureReason: lastError,
+          exitReason: null,
         });
-      } catch {}
+        logger.error('Buy TX failed — saved failed trade to DB', {
+          tradeId, mint: params.mint.slice(0, 12), error: lastError,
+        });
+      } catch (saveErr: unknown) {
+        logger.error('Failed to save failed buy trade to DB', {
+          error: saveErr instanceof Error ? saveErr.message : String(saveErr),
+        });
+      }
       positionRegistry.transition(tradeId, 'EXITED', `bonkfun buy failed: ${lastError}`);
       return { success: false, tradeId, signature: lastSignature, error: lastError };
     }
@@ -723,6 +732,7 @@ export async function executeBuy(params: BuyParams, runtime: ExecutionRuntime): 
         submittedAt: nowMs(),
         confirmedAt: nowMs(),
         failureReason: null,
+        exitReason: null,
       };
       await saveTrade(container, tradeRecord);
 
@@ -780,8 +790,15 @@ export async function executeBuy(params: BuyParams, runtime: ExecutionRuntime): 
     submittedAt: nowMs(),
     confirmedAt: null,
     failureReason: lastError ?? 'Unknown',
+    exitReason: null,
   };
-  await saveTrade(container, failedRecord);
+  try {
+    await saveTrade(container, failedRecord);
+  } catch (saveErr: unknown) {
+    logger.error('Failed to save failed buy trade to DB', {
+      error: saveErr instanceof Error ? saveErr.message : String(saveErr),
+    });
+  }
   return {
     success: false,
     tradeId,

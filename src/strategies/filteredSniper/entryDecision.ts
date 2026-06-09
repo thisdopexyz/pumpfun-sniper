@@ -39,7 +39,6 @@ import {
   MOMENTUM_WINDOW_MS,
   MAX_PRICE_IMPACT_BPS,
   MIN_CREATOR_SCORE,
-  MAX_BUNDLE_PCT,
   MAX_WASH_TRADE_SCORE,
   MIN_UNIQUE_WALLETS,
   MAX_SELL_RATIO_PCT,
@@ -48,20 +47,36 @@ import {
   HOLDER_BUNDLE_MAX_HOLDERS,
   MIN_HOLDER_FLOOR,
   MAX_VOLUME_MCAP_RATIO,
-  MIN_TOKEN_AGE_SECONDS,
   MAX_BUY_MCAP_USD,
   MIN_AVG_BUY_SIZE_LAMPORTS,
   MIN_HOLDER_COUNT,
+  MAX_WALLET_AGE_SCORE,
+  MAX_BUY_VELOCITY_SCORE,
+  MAX_ENHANCED_BUNDLE_PCT,
+  MAX_CROSS_TOKEN_SCORE,
 } from './filteredSniperRules.js';
 import { createLogger } from '../../telemetry/logging/logger.js';
+import { Counter } from 'prom-client';
+import { register } from '../../telemetry/metrics/prometheus.js';
 
 const logger = createLogger('strategy:entryDecision');
+
+// ---------------------------------------------------------------------------
+// Prometheus: per-filter rejection counters
+// ---------------------------------------------------------------------------
+
+const entryRejectionCounter = new Counter({
+  name: 'pumpfun_entry_rejections_total',
+  help: 'Total entry check rejections by check name',
+  labelNames: ['check_name'] as const,
+  registers: [register],
+});
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
-/** Data required for all 19 entry checks. */
+/** Data required for all 25 entry checks. */
 export interface EntryCheckData {
   readonly mint: MintAddress;
 
@@ -136,6 +151,18 @@ export interface EntryCheckData {
 
   /** Check 19: Number of smart wallets detected buying this token. */
   readonly smartWalletCount?: number;
+
+  /** Check 24: Wallet age score (0-100, higher = more new wallets). Null if unavailable. */
+  readonly walletAgeScore?: number | null;
+
+  /** Check 25: Buy velocity score (0-100, higher = more bot-like). Null if unavailable. */
+  readonly buyVelocityScore?: number | null;
+
+  /** Check 26: Enhanced bundle percentage (0-100). Null if unavailable. */
+  readonly enhancedBundlePct?: number | null;
+
+  /** Check 27: Cross-token correlation score (0-100). Null if unavailable. */
+  readonly crossTokenScore?: number | null;
 }
 
 /** Individual check result. */
@@ -288,21 +315,6 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
           : `Price impact too high: ${impactPct}% (max ${maxPct}%)`,
       };
     })(),
-    // Check 11: Bundle percentage acceptable (block if >30% bundled — match detector)
-    // BLOCK if data unavailable — can't assess risk without bundle data
-    (() => {
-      if (data.bundlePct == null) {
-        return { name: 'bundle_check', passed: false, reason: 'Bundle data unavailable — BLOCKING (risk too high without data)' };
-      }
-      const passed = data.bundlePct <= MAX_BUNDLE_PCT;
-      return {
-        name: 'bundle_check',
-        passed,
-        reason: passed
-          ? `Bundle OK: ${data.bundlePct.toFixed(1)}%`
-          : `TOO BUNDLED: ${data.bundlePct.toFixed(1)}% supply in few wallets (max 40%)`,
-      };
-    })(),
     // Check 12: Wash trade score acceptable (block if score > 60)
     (() => {
       if (data.washTradeScore == null) {
@@ -329,7 +341,7 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
         passed,
         reason: passed
           ? `Unique wallets OK: ${data.uniqueWallets}`
-          : `Too few unique wallets: ${data.uniqueWallets} (min 8)`,
+          : `Too few unique wallets: ${data.uniqueWallets} (min ${MIN_UNIQUE_WALLETS})`,
       };
     })(),
     // Check 14: Sell pressure acceptable (early dump detection)
@@ -459,23 +471,6 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
       };
     })(),
 
-    // Check 20: Minimum token age (avoid bot chaos zone)
-    // BLOCK if too young — first seconds are chaotic, no organic activity yet
-    // BLOCK if data unavailable — can't assess risk without age data
-    (() => {
-      if (data.secondsSinceLaunch == null) {
-        return { name: 'min_token_age', passed: false, reason: 'Token age unavailable — BLOCKING (no launch timestamp, risk too high)' };
-      }
-      const passed = data.secondsSinceLaunch >= MIN_TOKEN_AGE_SECONDS;
-      return {
-        name: 'min_token_age',
-        passed,
-        reason: passed
-          ? `Token age OK: ${data.secondsSinceLaunch}s (min ${MIN_TOKEN_AGE_SECONDS}s)`
-          : `TOO YOUNG: ${data.secondsSinceLaunch}s old (min ${MIN_TOKEN_AGE_SECONDS}s) — bot chaos zone, waiting for organic activity`,
-      };
-    })(),
-
     // Check 21: Maximum buy market cap (avoid already-pumped tokens)
     // BLOCK if mcap exceeds threshold — diminishing returns for small positions
     // BLOCK if data unavailable — can't assess risk without mcap data
@@ -527,6 +522,75 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
           : `TOO FEW HOLDERS: ${data.holderCount} (min ${MIN_HOLDER_COUNT}) — likely fake volume from few wallets`,
       };
     })(),
+
+    // Check 24: Wallet Age Score (Dev Multi-Wallet Defense)
+    // BLOCK if majority of buying wallets are brand new (< 1 hour old)
+    // BLOCK if data unavailable — critical anti-scam check
+    (() => {
+      if (data.walletAgeScore == null) {
+        return { name: 'wallet_age_score', passed: false, reason: 'Wallet age score unavailable — BLOCKING (anti-scam check requires data)' };
+      }
+      const passed = data.walletAgeScore <= MAX_WALLET_AGE_SCORE;
+      return {
+        name: 'wallet_age_score',
+        passed,
+        reason: passed
+          ? `Wallet age OK: score ${data.walletAgeScore} (max ${MAX_WALLET_AGE_SCORE})`
+          : `WALLETS TOO NEW: score ${data.walletAgeScore} (max ${MAX_WALLET_AGE_SCORE}) — majority of buyers are brand new wallets, likely dev multi-wallet scheme`,
+      };
+    })(),
+
+    // Check 25: Buy Velocity Score (Dev Multi-Wallet Defense)
+    // BLOCK if buy velocity indicates bot swarm or coordinated mass-buy
+    // BLOCK if data unavailable — critical anti-scam check
+    (() => {
+      if (data.buyVelocityScore == null) {
+        return { name: 'buy_velocity_score', passed: false, reason: 'Buy velocity score unavailable — BLOCKING (anti-scam check requires data)' };
+      }
+      const passed = data.buyVelocityScore <= MAX_BUY_VELOCITY_SCORE;
+      return {
+        name: 'buy_velocity_score',
+        passed,
+        reason: passed
+          ? `Buy velocity OK: score ${data.buyVelocityScore} (max ${MAX_BUY_VELOCITY_SCORE})`
+          : `BOT SWARM DETECTED: velocity score ${data.buyVelocityScore} (max ${MAX_BUY_VELOCITY_SCORE}) — too many wallets buying too fast, coordinated activity`,
+      };
+    })(),
+
+    // Check 26: Enhanced Bundle Percentage (Dev Multi-Wallet Defense)
+    // BLOCK if enhanced bundle % exceeds threshold (lowered from original 40%)
+    // Uses 180s window instead of 60s, catches slower multi-wallet schemes
+    // BLOCK if data unavailable — critical anti-scam check
+    (() => {
+      if (data.enhancedBundlePct == null) {
+        return { name: 'enhanced_bundle_pct', passed: false, reason: 'Enhanced bundle % unavailable — BLOCKING (anti-scam check requires data)' };
+      }
+      const passed = data.enhancedBundlePct <= MAX_ENHANCED_BUNDLE_PCT;
+      return {
+        name: 'enhanced_bundle_pct',
+        passed,
+        reason: passed
+          ? `Enhanced bundle OK: ${data.enhancedBundlePct.toFixed(1)}% (max ${MAX_ENHANCED_BUNDLE_PCT}%)`
+          : `ENHANCED BUNDLE TOO HIGH: ${data.enhancedBundlePct.toFixed(1)}% (max ${MAX_ENHANCED_BUNDLE_PCT}%) — wallets clustered by funding source, likely coordinated`,
+      };
+    })(),
+
+    // Check 27: Cross-Token Correlation (Dev Multi-Wallet Defense)
+    // BLOCK if wallets from previous dump-tokens are buying this token
+    // BLOCK if data unavailable — critical anti-scam check
+    (() => {
+      if (data.crossTokenScore == null) {
+        return { name: 'cross_token_score', passed: false, reason: 'Cross-token score unavailable — BLOCKING (anti-scam check requires data)' };
+      }
+      const passed = data.crossTokenScore <= MAX_CROSS_TOKEN_SCORE;
+      return {
+        name: 'cross_token_score',
+        passed,
+        reason: passed
+          ? `Cross-token OK: score ${data.crossTokenScore} (max ${MAX_CROSS_TOKEN_SCORE})`
+          : `SERIAL SCAMMER WALLETS: cross-token score ${data.crossTokenScore} (max ${MAX_CROSS_TOKEN_SCORE}) — wallets from previous dumps buying this token`,
+      };
+    })(),
   ];
 
   // Validate we have exactly 23 checks (compile-time safety)
@@ -548,6 +612,13 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
       passedCount,
     });
   } else {
+    // Increment per-filter rejection counters
+    for (const check of checks) {
+      if (!check.passed) {
+        entryRejectionCounter.inc({ check_name: check.name });
+      }
+    }
+
     logger.info('Entry decision: REJECTED', {
       mint: data.mint,
       passedCount,

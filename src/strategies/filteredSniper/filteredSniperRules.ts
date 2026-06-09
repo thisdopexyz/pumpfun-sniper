@@ -56,7 +56,7 @@ import {
  *   9. momentum threshold met
  *  10. price impact acceptable
  */
-export const ENTRY_CHECK_COUNT = 23;
+export const ENTRY_CHECK_COUNT = 25;
 
 /** Price impact rule: max price impact in basis points. LOCKED. */
 export const MAX_PRICE_IMPACT_BPS = DEFAULT_MAX_PRICE_IMPACT_BPS;
@@ -157,7 +157,7 @@ export const MAX_BUNDLE_PCT = 40;
 export const MAX_WASH_TRADE_SCORE = 60;
 
 /** Check 13: Minimum unique wallets in momentum window. */
-export const MIN_UNIQUE_WALLETS = 10;
+export const MIN_UNIQUE_WALLETS = 20;
 
 /** Check 14: Maximum sell ratio (sells as % of total trades). */
 export const MAX_SELL_RATIO_PCT = 60;
@@ -176,10 +176,26 @@ export const MIN_HOLDER_FLOOR = 30;
 export const MAX_VOLUME_MCAP_RATIO = 5;
 
 /** Check 22: Minimum average buy size in lamports (anti micro-buy spam). */
-export const MIN_AVG_BUY_SIZE_LAMPORTS = 100_000_000n; // 0.1 SOL
+export const MIN_AVG_BUY_SIZE_LAMPORTS = 150_000_000n; // 0.15 SOL
 
 /** Check 23: Minimum holder count (standalone, independent of bundle). */
 export const MIN_HOLDER_COUNT = 20;
+
+// ---------------------------------------------------------------------------
+// Dev Multi-Wallet Defense Thresholds (LOCKED)
+// ---------------------------------------------------------------------------
+
+/** Check 24: Maximum wallet age score (0-100). Higher = more new wallets. */
+export const MAX_WALLET_AGE_SCORE = 45;
+
+/** Check 25: Maximum buy velocity score (0-100). Higher = more bot-like. */
+export const MAX_BUY_VELOCITY_SCORE = 55;
+
+/** Check 26: Enhanced bundle — max bundle percentage (lowered from 40). */
+export const MAX_ENHANCED_BUNDLE_PCT = 25;
+
+/** Check 27: Maximum cross-token correlation score (0-100). */
+export const MAX_CROSS_TOKEN_SCORE = 40;
 
 // ---------------------------------------------------------------------------
 // Token Age & Market Cap Filters (LOCKED)

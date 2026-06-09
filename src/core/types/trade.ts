@@ -33,4 +33,5 @@ export interface TradeRecord {
   readonly submittedAt: number;
   readonly confirmedAt: number | null;
   readonly failureReason: string | null;
+  readonly exitReason: string | null;
 }

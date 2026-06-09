@@ -94,7 +94,7 @@ export const DEFAULT_METADATA_STRUCTURAL_PATTERNS: readonly RegExp[] = [
  * Rationale: 30s is enough for the first wave of organic buyers to show up,
  * while still catching tokens early in their lifecycle.
  */
-export const DEFAULT_MIN_TOKEN_AGE_SECONDS = 1800 as const;
+export const DEFAULT_MIN_TOKEN_AGE_SECONDS = 1200 as const;
 
 // ---------------------------------------------------------------------------
 // Market cap entry filter

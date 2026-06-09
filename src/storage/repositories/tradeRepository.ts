@@ -18,6 +18,7 @@ interface TradeRow {
   readonly submitted_at: string;
   readonly confirmed_at: string | null;
   readonly failure_reason: string | null;
+  readonly exit_reason: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -37,6 +38,7 @@ function toTradeRecord(row: TradeRow): TradeRecord {
     submittedAt: new Date(row.submitted_at).getTime(),
     confirmedAt: row.confirmed_at !== null ? new Date(row.confirmed_at).getTime() : null,
     failureReason: row.failure_reason,
+    exitReason: row.exit_reason ?? null,
   };
 }
 
@@ -63,13 +65,13 @@ export class TradeRepository implements IRepository<TradeRecord, TradeId> {
     await query({
       text: `INSERT INTO trades (
         id, mint, side, status, amount_sol, amount_tokens,
-        signature, slot, submitted_at, confirmed_at, failure_reason
+        signature, slot, submitted_at, confirmed_at, failure_reason, exit_reason
       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
         to_timestamp($9::double precision / 1000),
         CASE WHEN $10::double precision IS NOT NULL
              THEN to_timestamp($10::double precision / 1000)
              ELSE NULL END,
-        $11
+        $11, $12
       )
       ON CONFLICT (id) DO UPDATE SET
         mint           = EXCLUDED.mint,
@@ -81,7 +83,8 @@ export class TradeRepository implements IRepository<TradeRecord, TradeId> {
         slot           = EXCLUDED.slot,
         submitted_at   = EXCLUDED.submitted_at,
         confirmed_at   = EXCLUDED.confirmed_at,
-        failure_reason = EXCLUDED.failure_reason
+        failure_reason = EXCLUDED.failure_reason,
+        exit_reason    = EXCLUDED.exit_reason
       WHERE NOT (trades.status = 'CONFIRMED' AND EXCLUDED.status = 'FAILED')`,
       values: [
         record.id,
@@ -95,6 +98,7 @@ export class TradeRepository implements IRepository<TradeRecord, TradeId> {
         record.submittedAt,
         record.confirmedAt,
         record.failureReason,
+        record.exitReason ?? null,
       ],
     });
   }

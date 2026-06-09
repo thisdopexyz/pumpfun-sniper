@@ -237,6 +237,7 @@ export async function executeSell(params: SellParams, runtime: ExecutionRuntime)
           submittedAt: nowMs(),
           confirmedAt: sellConfirmed ? nowMs() : null,
           failureReason: sellConfirmed ? null : lastError,
+          exitReason: params.reason ?? null,
         });
       } catch (saveErr: unknown) {
         logger.error('Failed to save Jupiter sell trade', {
@@ -422,6 +423,7 @@ export async function executeSell(params: SellParams, runtime: ExecutionRuntime)
               submittedAt: Date.now(),
               confirmedAt: Date.now(),
               failureReason: null,
+              exitReason: params.reason ?? null,
             });
           } catch (saveErr: unknown) {
             logger.error('Failed to save BonkFun sell trade', {
@@ -750,6 +752,7 @@ export async function executeSell(params: SellParams, runtime: ExecutionRuntime)
         submittedAt: nowMs(),
         confirmedAt: sellConfirmed ? nowMs() : null,
         failureReason: sellConfirmed ? null : confirmationError,
+        exitReason: params.reason ?? null,
       });
     } catch (saveErr: unknown) {
       logger.error('Failed to save sell trade to DB', {

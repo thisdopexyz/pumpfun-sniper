@@ -114,6 +114,7 @@ export class PositionReconciler {
             submittedAt: nowMs(),
             confirmedAt: nowMs(),
             failureReason: 'RECONCILED: token balance 0 in wallet (manual sell or stale DB)',
+            exitReason: 'RECONCILED',
           });
 
           // Remove from position registry if present

@@ -24,6 +24,42 @@ import { register } from '../../telemetry/metrics/prometheus.js';
 const logger = createLogger('detectors:bundle');
 
 // ---------------------------------------------------------------------------
+// CEX Hot Wallet Exclusion List
+// ---------------------------------------------------------------------------
+// These are known centralized exchange hot wallets. When tracing funding
+// chains, we STOP at these addresses — they are shared by millions of users
+// and cannot be used to cluster wallets.
+
+const CEX_HOT_WALLETS = new Set([
+  // Binance
+  '5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1',
+  'H8sMJSCQxfKiFTCfDR3DUMLPwcRbM61LGFJ8N4dKydWw',
+  '2ojv9BAiHUrvsm9gxDe7fJSzbNZSrm5PbVSJTEwMLuXw',
+  'ANqY8h3sRFCwFronwDRcT5jvPacehtvkKjHRFRcMonVY',
+  // OKX
+  '6FEVkH1Jj6rmSr8H4jwzrFzLox6sM8YAB3CucyVHdUES',
+  'FpwQQhRkB3TkXeRCQwHLMcPdDcLHwGMsCfMdB4iAE6cB',
+  // Bybit
+  '5PAhQiYdLBd6SV4z2B6pSBc6ECFgx7UMzKcEqRWwKFzX',
+  '9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM',
+  // KuCoin
+  'HVrJ8qFA1Je4p88Jq3J7B1jE4aPg7z3Lm8MJz9FCcTAD',
+  // Bitfinex
+  '3gJ7KiHcFuXfMehJqFmPF9iMPNKHLLDWRhZG3Y8yBLzC',
+  // HTX (Huobi)
+  '57vSaRTqN9iXaemMJRqQD6nFmL2AMXfM3Kj1JS3wBZaF',
+  // Gate.io
+  'u6PJ8DtQuPFnfmwHbGFb8jKMqXQdJPJi3x5G36RLbQE',
+  // MEXC
+  '7GBaRQFydqBBF7HxSNTdK2w2x3Zi7qgQHdj5GnFv2J3',
+  // Phantom aggregator
+  '9CLoQ1cMQ5PG3dJtEHq5eMNoFwYrPg3C4uL3FAcBoqFA',
+]);
+
+/** Multi-hop funding trace depth (A funds B funds C → 3 hops). */
+const MAX_FUNDING_HOP_DEPTH = 3;
+
+// ---------------------------------------------------------------------------
 // Prometheus Metrics
 // ---------------------------------------------------------------------------
 
@@ -65,6 +101,8 @@ export interface BundleBuyEvent {
   readonly tokenAmount: bigint;
   /** Optional: the funding wallet that funded this buyer wallet. */
   readonly fundingWallet?: string;
+  /** Optional: multi-hop funding chain (oldest → newest). Used for CEX-aware tracing. */
+  readonly fundingChain?: readonly string[];
 }
 
 /** Internal buy record stored per token. */
@@ -74,6 +112,8 @@ interface BuyRecord {
   readonly timestamp: number;
   readonly tokenAmount: bigint;
   readonly fundingWallet?: string;
+  /** Multi-hop funding chain for CEX-aware clustering. */
+  readonly fundingChain?: readonly string[];
 }
 
 /** Per-token tracking state. */
@@ -108,9 +148,9 @@ export class BundleDetector implements IDetector {
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(config?: BundleDetectorConfig) {
-    this.windowMs = (config?.windowSeconds ?? 60) * 1000;
-    this.maxBundlePct = config?.maxBundlePct ?? 30;
-    this.minBuyCount = config?.minBuyCount ?? 2;
+    this.windowMs = (config?.windowSeconds ?? 180) * 1000; // Increased from 60s to 180s
+    this.maxBundlePct = config?.maxBundlePct ?? 20; // Lowered from 30% to 20%
+    this.minBuyCount = config?.minBuyCount ?? 5;
     this.cooldownMs = config?.cooldownMs ?? 120_000;
   }
 
@@ -191,6 +231,7 @@ export class BundleDetector implements IDetector {
         timestamp: event.timestamp,
         tokenAmount: event.tokenAmount,
         fundingWallet: event.fundingWallet,
+        fundingChain: event.fundingChain,
       });
     }
 
@@ -282,28 +323,9 @@ export class BundleDetector implements IDetector {
       }
     }
 
-    // 6. Also check slot-level aggregation: all buys in same slot
-    // This handles cases where multiple wallets buy in the same slot but
-    // the cluster approach doesn't catch them (e.g., only 1 wallet per slot)
-    const slotTokenAmounts = new Map<number, bigint>();
-    const slotWallets = new Map<number, Set<string>>();
-    for (const buy of buys) {
-      slotTokenAmounts.set(buy.slot, (slotTokenAmounts.get(buy.slot) ?? 0n) + buy.tokenAmount);
-      let set = slotWallets.get(buy.slot);
-      if (set === undefined) {
-        set = new Set();
-        slotWallets.set(buy.slot, set);
-      }
-      set.add(buy.wallet);
-    }
-
-    for (const [slot, tokens] of slotTokenAmounts) {
-      const pct = Number((tokens * 10000n) / totalTokenAmount) / 100;
-      if (pct > bestClusterPct) {
-        bestClusterPct = pct;
-        bestCluster = slotWallets.get(slot)!;
-      }
-    }
+    // NOTE: Slot-level aggregation REMOVED — same slot != bundle.
+    // On Solana many independent txs land in same block. Not evidence of coordination.
+    // Valid bundle signals: same-funding-source clustering + single-wallet concentration only.
 
     const bundlePct = bestClusterPct;
     bundlePctGauge.set(bundlePct);
@@ -359,12 +381,17 @@ export class BundleDetector implements IDetector {
 
   /**
    * Build clusters of wallets that share the same funding source.
-   * Returns an array of sets, each set = wallets funded by the same parent.
+   * Now with CEX exclusion: stops tracing at known CEX hot wallets.
+   * Also supports multi-hop funding chains (A → B → C).
+   * Returns an array of sets, each set = wallets funded by the same non-CEX root.
    */
   private buildFundingClusters(buys: BuyRecord[]): Array<Set<string>> {
     const fundingMap = new Map<string, Set<string>>();
     for (const buy of buys) {
       if (buy.fundingWallet !== undefined && buy.fundingWallet !== '') {
+        // Skip CEX hot wallets — can't cluster by CEX source
+        if (CEX_HOT_WALLETS.has(buy.fundingWallet)) continue;
+
         let set = fundingMap.get(buy.fundingWallet);
         if (set === undefined) {
           set = new Set();
@@ -373,6 +400,35 @@ export class BundleDetector implements IDetector {
         set.add(buy.wallet);
       }
     }
+
+    // Multi-hop: also check if any funding wallets are themselves funded
+    // by the same non-CEX source (merge clusters with shared upstream)
+    const upstreamMap = new Map<string, string>(); // wallet → root funder
+    for (const buy of buys) {
+      if (buy.fundingChain && buy.fundingChain.length > 1) {
+        // Walk the chain backwards to find the first non-CEX funder
+        let root = buy.fundingChain[0] ?? buy.fundingWallet;
+        for (let depth = 0; depth < Math.min(buy.fundingChain.length, MAX_FUNDING_HOP_DEPTH); depth++) {
+          const hop = buy.fundingChain[depth];
+          if (!hop) break;
+          if (CEX_HOT_WALLETS.has(hop)) {
+            // CEX reached — use previous hop as root
+            break;
+          }
+          root = hop;
+        }
+        if (root && !CEX_HOT_WALLETS.has(root)) {
+          upstreamMap.set(buy.wallet, root);
+          let set = fundingMap.get(root);
+          if (set === undefined) {
+            set = new Set();
+            fundingMap.set(root, set);
+          }
+          set.add(buy.wallet);
+        }
+      }
+    }
+
     const clusters: Array<Set<string>> = [];
     for (const set of fundingMap.values()) {
       if (set.size >= 2) {

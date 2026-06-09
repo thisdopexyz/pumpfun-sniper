@@ -35,6 +35,10 @@ import { SmartMoneyDetector } from './detectors/smartMoney/smartMoneyDetector.js
 import { CabalDetector } from './detectors/cabal/cabalDetector.js';
 import { ConcentrationAnalyzer } from './detectors/holderConcentration/concentrationAnalyzer.js';
 import { DayPhaseDetector } from './detectors/dayPhase/dayPhaseDetector.js';
+import { WalletAgeDetector } from './detectors/walletAge/walletAgeDetector.js';
+import { BuyVelocityAnalyzer } from './detectors/buyVelocity/buyVelocityAnalyzer.js';
+import { CrossTokenCorrelator } from './detectors/crossToken/crossTokenCorrelator.js';
+import { buildRpcPoolFromEnv } from './infra/rpcPool.js';
 import { CandleAnalyzer } from './strategies/filteredSniper/candleAnalyzer.js';
 import { CompoundManager } from './strategies/filteredSniper/compoundManager.js';
 import { EventDispatcher } from './ingestion/pipeline/eventDispatcher.js';
@@ -174,11 +178,32 @@ async function main(): Promise<void> {
   const candleAnalyzer = new CandleAnalyzer();
   const compoundManager = new CompoundManager();
 
+  // Dev Multi-Wallet Defense detectors (Phase 6)
+  // WalletAgeDetector with multi-RPC pool (7 Helius endpoints, rate-limited)
+  const walletAgeRpcPool = buildRpcPoolFromEnv();
+  const walletAgeDetector = new WalletAgeDetector(walletAgeRpcPool);
+  const buyVelocityAnalyzer = new BuyVelocityAnalyzer();
+  const crossTokenCorrelator = new CrossTokenCorrelator();
+
   // Create dataProvider now that detectors exist (needs bundle + wash + smartMoney data)
   const antiRugMonitor = new AntiRugMonitor(container.connection);
-  dataProvider = createDataProvider(container, positionRegistry, { bundleDetector, washTradeDetector, smartMoneyDetector }, antiRugMonitor);
+  dataProvider = createDataProvider(container, positionRegistry, { bundleDetector, washTradeDetector, smartMoneyDetector, walletAgeDetector, buyVelocityAnalyzer, crossTokenCorrelator }, antiRugMonitor);
   strategy = new FilteredSniperStrategy(dataProvider, executionDelegate, undefined, undefined, container.riskStateRepository, container.maxExposureGuard);
   container.setStrategy(strategy);
+
+  // Cross-token dump detection: when strategy exits, mark token as dump
+  // This captures wallets that bought the same dumped token
+  const originalMonitorTrade = strategy.monitorTrade.bind(strategy);
+  (strategy as any).monitorTrade = (tradeId: string, mint?: string) => {
+    const result = originalMonitorTrade(tradeId, mint);
+    // After trade monitoring, check if position was exited
+    const pos = positionRegistry.get(tradeId);
+    if (pos && pos.status === 'EXITED' && mint) {
+      crossTokenCorrelator.markDump(mint);
+      logger.info('CrossToken: marked token as dump after exit', { mint: mint.slice(0, 12) });
+    }
+    return result;
+  };
 
   // Load persisted scale-out tiers from DB
   await strategy.loadCompletedTiers();
@@ -203,6 +228,12 @@ async function main(): Promise<void> {
       id: generateId('sig'), type: 'LAUNCH' as const, mint: s.mint,
       timestamp: nowMs(), slot: s.slot ?? 0, creator: s.creator ?? '', signature: s.signature ?? '',
     }).catch(() => {});
+
+    // Feed creator to wallet age detector (resolves creator wallet age)
+    if (s.creator) {
+      walletAgeDetector.setCreator(s.mint, s.creator).catch(() => {});
+    }
+
     strategy.onSignal(signal).catch((err: unknown) => {
       logger.error('Launch signal processing failed', {
         mint: signal.mint,
@@ -298,6 +329,22 @@ async function main(): Promise<void> {
     void container.signalRepository.save(signal).catch(() => {});
   });
 
+  // Dev Multi-Wallet Defense signal handlers
+  walletAgeDetector.onSignal((signal) => {
+    logger.warn('WalletAge signal detected', { mint: signal.mint });
+    void container.signalRepository.save(signal).catch(() => {});
+  });
+
+  buyVelocityAnalyzer.onSignal((signal) => {
+    logger.warn('BuyVelocity signal detected', { mint: signal.mint });
+    void container.signalRepository.save(signal).catch(() => {});
+  });
+
+  crossTokenCorrelator.onSignal((signal) => {
+    logger.warn('CrossToken signal detected', { mint: signal.mint });
+    void container.signalRepository.save(signal).catch(() => {});
+  });
+
   // Register event dispatcher handlers → feed events to detectors
   dispatcher.on('launch', (event) => {
     launchDetector.handleLaunchEvent({
@@ -339,6 +386,23 @@ async function main(): Promise<void> {
       cabalDetector.recordTrade(mint, wallet, timestamp);
     }
 
+    // Feed buy events to Dev Multi-Wallet Defense detectors
+    if (isBuy && wallet) {
+      walletAgeDetector.recordBuy(mint, wallet).catch((err: unknown) => {
+        logger.debug('WalletAge recordBuy failed (non-blocking)', {
+          mint: mint.slice(0, 12), wallet: wallet.slice(0, 8),
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+      buyVelocityAnalyzer.recordBuy(mint, wallet, timestamp, Number(solAmount) / 1e9);
+      crossTokenCorrelator.recordBuy(mint, wallet, timestamp);
+    }
+
+    // Cross-token: feed sell events too (for dump detection)
+    if (!isBuy && wallet) {
+      crossTokenCorrelator.recordBuy(mint, wallet, timestamp);
+    }
+
     // Record candle data for exit analysis (approximate OHLC from individual trades)
     const priceApprox = Number(solAmount) / 1e9;
     candleAnalyzer.recordCandle(mint, {
@@ -354,7 +418,7 @@ async function main(): Promise<void> {
     });
   });
 
-  logger.info('Detection pipeline ready (launch + momentum + migration + bundle + washTrade + dexPaid + revoke + smartMoney + cabal + concentration + dayPhase + candleAnalyzer + compoundManager)');
+  logger.info('Detection pipeline ready (launch + momentum + migration + bundle + washTrade + dexPaid + revoke + smartMoney + cabal + concentration + dayPhase + candleAnalyzer + compoundManager + WALLET_AGE + BUY_VELOCITY + CROSS_TOKEN)');
   const cs = compoundManager.getCompoundStats();
   logger.info('Compound manager ready', { coldWalletPct: cs.coldWalletPct, tradingWalletPct: cs.tradingWalletPct });
   await launchDetector.start();
@@ -368,6 +432,9 @@ async function main(): Promise<void> {
   await cabalDetector.start();
   await concentrationAnalyzer.start();
   await dayPhaseDetector.start();
+  await walletAgeDetector.start();
+  await buyVelocityAnalyzer.start();
+  await crossTokenCorrelator.start();
 
   // Step 4.5: Initialize EventRecorder for backtest replay
   const eventRecorder = new EventRecorder(container.pgPool);

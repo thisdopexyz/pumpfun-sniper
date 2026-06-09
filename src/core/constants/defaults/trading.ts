@@ -38,7 +38,7 @@ export const DEFAULT_STOP_LOSS_PCT = 50 as const;
 export const DEFAULT_TRAILING_ACTIVATION_PCT = 200 as const;
 
 /** Trailing stop — drops this % from highest price to trigger sell. 0 = disabled. */
-export const DEFAULT_TRAILING_STOP_PCT = 30 as const;
+export const DEFAULT_TRAILING_STOP_PCT = 55 as const;
 
 // ---------------------------------------------------------------------------
 // Timeouts & concurrency

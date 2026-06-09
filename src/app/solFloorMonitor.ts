@@ -106,7 +106,7 @@ export function startSolFloorMonitor(config: SolFloorMonitorConfig): () => void 
           void executeSell({
             tradeId: pos.id,
             mint: pos.mint,
-            reason: 'STOP_LOSS',
+            reason: 'SOL_FLOOR',
             slippageBps: SLIPPAGE_BPS,
             sellPct: 100,
           }).then((result) => {
