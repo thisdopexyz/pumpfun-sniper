@@ -400,15 +400,23 @@ export class WalletAgeDetector implements IDetector {
 
   /**
    * Resolve wallet age: cache hit → return cached, cache miss → RPC fetch.
+   * Retries once on failure to prevent null from transient RPC issues.
    */
   private async resolveWalletAge(wallet: string): Promise<number | null> {
     const cached = this.walletAgeCache.get(wallet);
     if (cached !== undefined) return cached;
 
-    const firstTxTime = await this.fetchWalletCreationTime(wallet);
-    if (firstTxTime === null) return null;
-    this.walletAgeCache.set(wallet, firstTxTime);
-    return firstTxTime;
+    // Try twice to prevent null from transient RPC failures
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const firstTxTime = await this.fetchWalletCreationTime(wallet);
+      if (firstTxTime !== null) {
+        this.walletAgeCache.set(wallet, firstTxTime);
+        return firstTxTime;
+      }
+      // Wait 500ms before retry
+      if (attempt === 0) await new Promise(r => setTimeout(r, 500));
+    }
+    return null; // Both attempts failed
   }
 
   /**
@@ -419,7 +427,9 @@ export class WalletAgeDetector implements IDetector {
     try {
       const pubkey = new PublicKey(wallet);
       let oldestBlockTime: number | null = null;
+      let newestBlockTime: number | null = null;
       let before: string | undefined = undefined;
+      let totalSigs = 0;
 
       for (let page = 0; page < 3; page++) {
         const conn = this.rpcPool.next();
@@ -432,11 +442,26 @@ export class WalletAgeDetector implements IDetector {
           throw err;
         }
         if (!sigs || sigs.length === 0) break;
+        totalSigs += sigs.length;
         const lastSig = sigs[sigs.length - 1];
         if (lastSig?.blockTime) oldestBlockTime = lastSig.blockTime * 1000;
+        // Track newest (from first page, first element)
+        if (page === 0 && sigs[0]?.blockTime) newestBlockTime = sigs[0].blockTime * 1000;
         if (sigs.length < 100) break;
         before = lastSig?.signature;
       }
+
+      // HIGH-ACTIVITY WALLET DETECTION:
+      // If we got 300 txs but they span < 60 seconds, the wallet is OLD and very active.
+      // We can't paginate far enough → treat as established (30 days).
+      if (totalSigs >= 300 && oldestBlockTime && newestBlockTime) {
+        const spanMs = newestBlockTime - oldestBlockTime;
+        if (spanMs < 60_000) {
+          // High-activity wallet (CEX, bot, etc.) — definitely not new
+          return nowMs() - (30 * 24 * 60 * 60 * 1000); // 30 days ago
+        }
+      }
+
       return oldestBlockTime;
     } catch {
       return null; // RPC failure → exclude from scoring
