@@ -88,6 +88,7 @@ export class WsManager {
 
       const maxRetries = 5;
       const baseDelay = 5000; // 5 seconds
+      const maxDelay = 120_000; // 2 minutes max
 
       const attemptConnect = (): void => {
         const onOpenHandler = (): void => {
@@ -104,17 +105,25 @@ export class WsManager {
           logger.error('WebSocket connection error', { error: err.message });
           cleanupTimeout();
           
-          // Check if it's a 429 rate limit
-          if (err.message.includes('429') && this.retryCount < maxRetries) {
+          // Check if it's a 429 rate limit — NEVER give up, just keep rotating
+          if (err.message.includes('429')) {
             this.retryCount++;
             // Rotate to next URL on 429
             this.rotateUrl();
-            const delay = baseDelay * Math.pow(2, this.retryCount - 1);
+            // Cap delay at 2 minutes
+            const delay = Math.min(baseDelay * Math.pow(2, Math.min(this.retryCount - 1, 6)), maxDelay);
             logger.warn('WebSocket 429 rate limited, retrying with rotated URL', {
               attempt: this.retryCount,
-              maxRetries,
               delayMs: delay,
             });
+            setTimeout(attemptConnect, delay);
+            return;
+          }
+          
+          // Non-429 errors: fail after maxRetries
+          if (this.retryCount < maxRetries) {
+            this.retryCount++;
+            const delay = baseDelay * Math.pow(2, this.retryCount - 1);
             setTimeout(attemptConnect, delay);
             return;
           }
