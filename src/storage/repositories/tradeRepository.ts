@@ -171,16 +171,25 @@ export class TradeRepository implements IRepository<TradeRecord, TradeId> {
                 AND s.id LIKE ('sell-' || b.id || '%')
             )
             OR
-            -- Matching sell exists but is PARTIAL (sell tokens < buy tokens)
-            -- This handles SCALE-OUT where bot sold 50% but still holds remainder
-            EXISTS (
-              SELECT 1
-              FROM trades s
-              WHERE s.side = 'SELL'
-                AND s.status = 'CONFIRMED'
-                AND s.mint = b.mint
-                AND s.id LIKE ('sell-' || b.id || '%')
-                AND s.amount_tokens < b.amount_tokens
+            -- Matching sells exist but total sold < bought (still holding remainder)
+            -- Uses SUM to handle scale-out where multiple partial sells add up
+            (
+              EXISTS (
+                SELECT 1
+                FROM trades s
+                WHERE s.side = 'SELL'
+                  AND s.status = 'CONFIRMED'
+                  AND s.mint = b.mint
+                  AND s.id LIKE ('sell-' || b.id || '%')
+              )
+              AND (
+                SELECT COALESCE(SUM(s.amount_tokens), 0)
+                FROM trades s
+                WHERE s.side = 'SELL'
+                  AND s.status = 'CONFIRMED'
+                  AND s.mint = b.mint
+                  AND s.id LIKE ('sell-' || b.id || '%')
+              ) < b.amount_tokens
             )
           )
         ORDER BY COALESCE(b.confirmed_at, b.submitted_at) ASC`,

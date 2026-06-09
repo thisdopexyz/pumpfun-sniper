@@ -28,8 +28,8 @@ export const DEFAULT_BASE_POSITION_SIZE_USD = 1.0 as const;
 // Take profit / Stop loss / Trailing
 // ---------------------------------------------------------------------------
 
-/** Take profit — LOCKED: +100000% */
-export const DEFAULT_TAKE_PROFIT_PCT = 100000 as const;
+/** Take profit — LOCKED: +9900% (100x) */
+export const DEFAULT_TAKE_PROFIT_PCT = 9900 as const;
 
 /** Stop loss — LOCKED: -50% */
 export const DEFAULT_STOP_LOSS_PCT = 50 as const;

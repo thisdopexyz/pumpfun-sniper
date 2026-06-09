@@ -27,8 +27,10 @@ const logger = createLogger('app:wsManager');
 // ---------------------------------------------------------------------------
 
 export interface WsManagerConfig {
-  /** WebSocket URL. */
+  /** Primary WebSocket URL. */
   readonly url: string;
+  /** Fallback WebSocket URLs (rotated on 429). */
+  readonly fallbackUrls?: readonly string[];
   /** Called when a message is received. */
   readonly onMessage: (data: Buffer) => void;
   /** Called when the connection is opened (including reconnects). */
@@ -42,21 +44,36 @@ export interface WsManagerConfig {
 // ---------------------------------------------------------------------------
 
 export class WsManager {
-  private readonly url: string;
+  private readonly urls: readonly string[];
   private readonly onMessage: (data: Buffer) => void;
   private readonly onOpen?: () => void;
   private readonly onFatal?: () => void;
 
   private ws: WebSocket | null = null;
   private retryCount = 0;
+  private urlIndex = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private intentionalClose = false;
 
   constructor(config: WsManagerConfig) {
-    this.url = config.url;
+    this.urls = [config.url, ...(config.fallbackUrls ?? [])];
     this.onMessage = config.onMessage;
     this.onOpen = config.onOpen;
     this.onFatal = config.onFatal;
+  }
+
+  private get currentUrl(): string {
+    return this.urls[this.urlIndex]!;
+  }
+
+  private rotateUrl(): void {
+    if (this.urls.length > 1) {
+      this.urlIndex = (this.urlIndex + 1) % this.urls.length;
+      logger.info('Rotated WebSocket URL', {
+        index: this.urlIndex,
+        url: this.currentUrl.replace(/api-key=[^&]+/, 'api-key=***'),
+      });
+    }
   }
 
   /**
@@ -74,7 +91,9 @@ export class WsManager {
 
       const attemptConnect = (): void => {
         const onOpenHandler = (): void => {
-          logger.info('WebSocket connected');
+          logger.info('WebSocket connected', {
+            url: this.currentUrl.replace(/api-key=[^&]+/, 'api-key=***'),
+          });
           cleanupTimeout();
           this.retryCount = 0;
           this.onOpen?.();
@@ -88,8 +107,10 @@ export class WsManager {
           // Check if it's a 429 rate limit
           if (err.message.includes('429') && this.retryCount < maxRetries) {
             this.retryCount++;
+            // Rotate to next URL on 429
+            this.rotateUrl();
             const delay = baseDelay * Math.pow(2, this.retryCount - 1);
-            logger.warn('WebSocket 429 rate limited, retrying', {
+            logger.warn('WebSocket 429 rate limited, retrying with rotated URL', {
               attempt: this.retryCount,
               maxRetries,
               delayMs: delay,
@@ -101,7 +122,7 @@ export class WsManager {
           reject(err);
         };
 
-        this.ws = new WebSocket(this.url);
+        this.ws = new WebSocket(this.currentUrl);
 
         const timeoutId = setTimeout(() => {
           cleanupTimeout();
@@ -202,7 +223,7 @@ export class WsManager {
   private doReconnect(): void {
     logger.info('Attempting WebSocket reconnect', { attempt: this.retryCount });
 
-    this.ws = new WebSocket(this.url);
+    this.ws = new WebSocket(this.currentUrl);
 
     const timeoutId = setTimeout(() => {
       logger.warn('Reconnect timed out', { attempt: this.retryCount });

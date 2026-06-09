@@ -495,12 +495,28 @@ async function main(): Promise<void> {
     executeSell: executionDelegate.executeSell,
   });
 
-  // Step 6: Connect WebSocket (using WsManager with auto-reconnect)
+  // Step 6: Connect WebSocket (using WsManager with auto-reconnect + URL rotation)
   logger.info('Connecting to Helius WebSocket...');
   const wsUrl = container.wsUrl;
 
+  // Build fallback WS URLs from HELIUS_EXTRA_KEYS for 429 rotation
+  const wsFallbackUrls: string[] = [];
+  const extraKeys = process.env['HELIUS_EXTRA_KEYS'];
+  if (extraKeys) {
+    for (const key of extraKeys.split(',')) {
+      const trimmed = key.trim();
+      if (trimmed) {
+        wsFallbackUrls.push(`wss://mainnet.helius-rpc.com/?api-key=${trimmed}`);
+      }
+    }
+  }
+  if (wsFallbackUrls.length > 0) {
+    logger.info('WS fallback URLs loaded', { count: wsFallbackUrls.length });
+  }
+
   const wsManager = new WsManager({
     url: wsUrl,
+    fallbackUrls: wsFallbackUrls,
     onOpen: () => {
       // Subscribe to Pump.fun program logs
       logger.info('Subscribing to pump.fun program logs...');
@@ -523,6 +539,7 @@ async function main(): Promise<void> {
   // Helius may silently drop a second logsSubscribe on the same connection
   const launchLabWsManager = new WsManager({
     url: wsUrl,
+    fallbackUrls: wsFallbackUrls,
     onOpen: () => {
       logger.info('Subscribing to LaunchLab program logs (BonkFun) — separate connection...');
       launchLabWsManager.send(JSON.stringify({
