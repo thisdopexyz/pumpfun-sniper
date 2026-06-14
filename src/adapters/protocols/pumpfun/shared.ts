@@ -40,8 +40,11 @@ export const PUBKEY_LENGTH = 32;
 /** Prefix for base64-encoded program data in transaction logs. */
 export const PROGRAM_DATA_PREFIX = 'Program data: ';
 
-/** Create instruction log pattern. */
+/** Legacy create instruction log pattern. */
 export const CREATE_INSTRUCTION_LOG = 'Program log: Instruction: Create';
+
+/** CreateV2 instruction log pattern (current Pump.fun default since late 2024). */
+export const CREATE_INSTRUCTION_LOG_V2 = 'Program log: Instruction: CreateV2';
 
 // ---------------------------------------------------------------------------
 // Buffer Helpers

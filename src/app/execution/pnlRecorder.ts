@@ -23,18 +23,22 @@ export function recordPnlAndRisk(
   mint?: string,
 ): void {
   const wasStopLoss = reason === 'STOP_LOSS' || reason === 'TIMEOUT' || reason === 'TRAILING_STOP' || reason === 'ANTI_RUG';
+  const wasManualSell = reason === 'MANUAL_SELL' || reason === 'MANUAL';
 
   container.dailyLossGuard.recordTrade(pnlUsd, wasStopLoss);
 
-  // Blacklist token on loss exits to prevent re-entry
+  // Blacklist token on loss exits OR manual sells to prevent re-entry
+  // Manual sell = user protecting capital from rug, never re-enter
   // BUT NOT for TIMEOUT if position was profitable (pnlUsd >= 0)
   //   — timeout on a profitable position (e.g., after scale-out) shouldn't blacklist
   // Note: BREAKEVEN_SL is not in wasStopLoss, so it's already excluded
-  const shouldBlacklist = wasStopLoss && mint &&
-    !(reason === 'TIMEOUT' && pnlUsd >= 0);
+  const shouldBlacklist = mint && (
+    (wasStopLoss && !(reason === 'TIMEOUT' && pnlUsd >= 0)) ||
+    wasManualSell
+  );
   if (shouldBlacklist) {
     container.tokenBlacklist.handleStopLoss(mint);
-    logger.info('Token blacklisted after stop-loss exit', { tradeId, mint: mint.slice(0, 12) });
+    logger.info('Token blacklisted after exit', { tradeId, reason, mint: mint.slice(0, 12) });
   }
 
   // Cooldown triggers on ALL exits except SCALE_OUT (partial sell — position

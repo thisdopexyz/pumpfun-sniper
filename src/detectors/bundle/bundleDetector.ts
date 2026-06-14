@@ -83,6 +83,22 @@ const bundlePctGauge = new Gauge({
 export interface BundleDetectorConfig {
   /** Early window in seconds from first buy. Default: 60. */
   readonly windowSeconds?: number;
+  /**
+   * Minimum elapsed time (ms) before forceAnalyze will return data.
+   * Default: 30000 (30s) — matches momentum detector's window so that
+   * entry checks at momentum-signal time have bundle data available.
+   * Must be <= windowMs. If a buyer's momentum signal fires at 30s but
+   * the bundle window is 60s, forceAnalyze would otherwise return null
+   * and the entry check would BLOCK with "Bundle % unavailable".
+   */
+  readonly forceAnalyzeMinMs?: number;
+  /**
+   * Safety margin added to partial-window bundle estimates (0-100 pct).
+   * Default: 5. Compensates for the fact that 30-60s of additional buys
+   * could push the pct higher than what we observed at forceAnalyzeMinMs.
+   * Set to 0 to disable, or higher for stricter early-window analysis.
+   */
+  readonly partialWindowSafetyMarginPct?: number;
   /** Max bundle percentage before emitting signal. Default: 30. */
   readonly maxBundlePct?: number;
   /** Minimum buy count to analyze. Default: 5. */
@@ -141,6 +157,8 @@ export class BundleDetector implements IDetector {
   private signalCounter = 0;
 
   private readonly windowMs: number;
+  private readonly forceAnalyzeMinMs: number;
+  private readonly partialWindowSafetyMarginPct: number;
   private readonly maxBundlePct: number;
   private readonly minBuyCount: number;
   private readonly cooldownMs: number;
@@ -149,6 +167,14 @@ export class BundleDetector implements IDetector {
 
   constructor(config?: BundleDetectorConfig) {
     this.windowMs = (config?.windowSeconds ?? 180) * 1000; // Increased from 60s to 180s
+    // Default forceAnalyzeMinMs = 30s (matches momentum detector's 30s window).
+    // If a token's momentum signal fires at 30s but the bundle window is 60s,
+    // we still need bundle data for the entry check — otherwise the check
+    // blocks with "Bundle % unavailable" and we miss the trade entirely.
+    // Must be <= windowMs; if user sets it higher, clamp to windowMs.
+    const requestedMinMs = config?.forceAnalyzeMinMs ?? 30_000;
+    this.forceAnalyzeMinMs = Math.min(requestedMinMs, this.windowMs);
+    this.partialWindowSafetyMarginPct = config?.partialWindowSafetyMarginPct ?? 5;
     this.maxBundlePct = config?.maxBundlePct ?? 20; // Lowered from 30% to 20%
     this.minBuyCount = config?.minBuyCount ?? 5;
     this.cooldownMs = config?.cooldownMs ?? 120_000;
@@ -251,6 +277,18 @@ export class BundleDetector implements IDetector {
   /**
    * Force-analyze a token's bundle state (e.g., at migration or when
    * the caller wants an immediate check). Returns the bundle pct.
+   *
+   * Two-tier analysis:
+   *  - Window closed (elapsed >= windowMs): full authoritative analysis.
+   *  - Window open but elapsed >= forceAnalyzeMinMs: partial-window
+   *    analysis with a safety margin added (configurable, default +5%).
+   *    This lets the entry check at momentum-signal time (~30s) have
+   *    data, even when the full 60s bundle window hasn't closed yet.
+   *    Risk: scammers spreading buys across 30-60s could push the
+   *    real bundle % higher than our partial estimate — the safety
+   *    margin compensates for this.
+   *  - Window open AND elapsed < forceAnalyzeMinMs: returns null
+   *    (truly insufficient data — token is too fresh).
    */
   forceAnalyze(mint: MintAddress): number | null {
     const state = this.tokenStates.get(mint);
@@ -258,7 +296,66 @@ export class BundleDetector implements IDetector {
       return null; // Insufficient data — can't assess risk
     }
 
+    const elapsed = nowMs() - state.windowStart;
+
+    if (!state.windowClosed) {
+      if (elapsed < this.forceAnalyzeMinMs) {
+        // Window not yet at minimum threshold — token is too fresh
+        // to assess bundle risk. Caller should treat as unavailable.
+        logger.debug('Bundle forceAnalyze: too early in window, deferring', {
+          mint: mint.slice(0, 12),
+          elapsedMs: elapsed,
+          forceAnalyzeMinMs: this.forceAnalyzeMinMs,
+          remainingMs: this.forceAnalyzeMinMs - elapsed,
+        });
+        return null;
+      }
+      if (elapsed < this.windowMs) {
+        // Partial-window estimate: run analysis now, add safety margin
+        // to compensate for buys that will arrive in the remaining
+        // windowMs - elapsed ms.
+        const partial = this.analyzeBundle(mint, state);
+        if (partial === null) return null;
+        const adjusted = Math.min(100, partial + this.partialWindowSafetyMarginPct);
+        if (adjusted !== partial) {
+          logger.debug('Bundle forceAnalyze: partial-window estimate with safety margin', {
+            mint: mint.slice(0, 12),
+            partialPct: partial,
+            safetyMarginPct: this.partialWindowSafetyMarginPct,
+            adjustedPct: adjusted,
+            elapsedMs: elapsed,
+            windowMs: this.windowMs,
+          });
+        }
+        return adjusted;
+      }
+      // Window has elapsed but no buy triggered closure yet — force close
+      state.windowClosed = true;
+    }
+
     return this.analyzeBundle(mint, state);
+  }
+
+  /**
+   * Pre-warm the bundle detector with a launch event. Initializes an
+   * empty token state so that handleBuy can record buys against it
+   * even if a momentum signal fires before the first buy event reaches
+   * the detector. Also used to ensure the elapsed time is measured from
+   * the actual launch moment, not the first buy (which can lag by a
+   * few hundred ms in WS processing).
+   *
+   * Returns true if a new state was created, false if one already
+   * existed (idempotent — safe to call multiple times).
+   */
+  handleLaunch(mint: MintAddress, timestamp?: number): boolean {
+    if (this.tokenStates.has(mint)) return false;
+    this.tokenStates.set(mint, {
+      windowStart: timestamp ?? nowMs(),
+      buys: [],
+      lastSignalAt: 0,
+      windowClosed: false,
+    });
+    return true;
   }
 
   // -------------------------------------------------------------------------

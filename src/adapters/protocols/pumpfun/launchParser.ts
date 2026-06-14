@@ -11,7 +11,10 @@ import { createLogger } from '../../../telemetry/logging/logger.js';
 import {
   PROGRAM_DATA_PREFIX,
   CREATE_INSTRUCTION_LOG,
+  CREATE_INSTRUCTION_LOG_V2,
   readBorshString,
+  readPublicKey,
+  readU64LE,
 } from './shared.js';
 
 const logger = createLogger('adapters:pumpfun:launchParser');
@@ -140,6 +143,98 @@ function tryDecodeBase64EventData(
 
 // readBorshString imported from ./shared.ts
 
+/**
+ * Decode a Pump.fun CreateV2 program data payload.
+ *
+ * CreateV2 layout (verified from Pump.fun IDL — see
+ * node_modules/@pump-fun/pump-sdk/src/idl/pump.ts createEvent struct):
+ *   Offset  0-7  : event discriminator (8 bytes, skip)
+ *   Offset  8-?  : name  (borsh string: u32 length + utf8)
+ *   Offset  ?-?  : symbol (borsh string)
+ *   Offset  ?-?  : uri    (borsh string)
+ *   Offset  ?-?  : mint   (32 bytes pubkey)
+ *   Offset  ?-?  : bondingCurve (32 bytes pubkey)
+ *   Offset  ?-?  : user    (32 bytes pubkey)
+ *   Offset  ?-?  : creator (32 bytes pubkey)
+ *   Offset  ?-?  : timestamp (i64 LE, 8 bytes)
+ *   Offset  ?-?  : virtualTokenReserves (u64 LE, 8 bytes)
+ *   Offset  ?-?  : virtualSolReserves   (u64 LE, 8 bytes)
+ *   Offset  ?-?  : realTokenReserves    (u64 LE, 8 bytes)
+ *   Offset  ?-?  : tokenTotalSupply     (u64 LE, 8 bytes)
+ *   Offset  ?-?  : tokenProgram         (32 bytes pubkey)
+ *   Offset  ?-?  : isMayhemMode         (u8)
+ *   Offset  ?-?  : isCashbackEnabled    (u8)
+ *   Offset  ?-?  : quoteMint            (32 bytes pubkey)
+ *   Offset  ?-?  : virtualQuoteReserves (u64 LE, 8 bytes)
+ *
+ * Min length: 8 (disc) + 3*(4+1) + 5*32 + 6*8 + 1 + 1 = 233 bytes.
+ */
+function tryDecodeCreateV2EventData(
+  base64Data: string,
+): {
+  mint: string;
+  creator: string;
+  name: string;
+  symbol: string;
+  uri: string;
+  virtualSolReserves: bigint;
+  virtualTokenReserves: bigint;
+} | null {
+  try {
+    const buf = Buffer.from(base64Data, 'base64');
+
+    // 8 disc + 3*(4+1) min strings + 5*32 pubkeys + 6*8 u64s + 2 bools
+    const MIN_EVENT_LEN = 8 + 15 + 160 + 48 + 2;
+    if (buf.length < MIN_EVENT_LEN) {
+      return null;
+    }
+
+    let offset = 8; // skip discriminator
+
+    // Strings: name, symbol, uri
+    const nameResult = readBorshString(buf, offset);
+    if (nameResult === null) return null;
+    offset += nameResult.bytesRead;
+    const symbolResult = readBorshString(buf, offset);
+    if (symbolResult === null) return null;
+    offset += symbolResult.bytesRead;
+    const uriResult = readBorshString(buf, offset);
+    if (uriResult === null) return null;
+    offset += uriResult.bytesRead;
+
+    // Pubkeys: mint, bondingCurve, user, creator
+    if (offset + 4 * 32 > buf.length) return null;
+    const mint = readPublicKey(buf, offset).toBase58();
+    offset += 32;
+    offset += 32; // skip bondingCurve (we derive it on demand)
+    offset += 32; // skip user
+    const creator = readPublicKey(buf, offset).toBase58();
+    offset += 32;
+
+    // Numerics we care about: virtualTokenReserves, virtualSolReserves
+    if (offset + 8 + 8 > buf.length) return null;
+    offset += 8; // skip timestamp (i64)
+    const virtualTokenReserves = readU64LE(buf, offset);
+    offset += 8;
+    const virtualSolReserves = readU64LE(buf, offset);
+    // remaining fields (realTokenReserves, tokenTotalSupply, tokenProgram,
+    // isMayhemMode, isCashbackEnabled, quoteMint, virtualQuoteReserves)
+    // are not needed for downstream launch detection — skip.
+
+    return {
+      mint,
+      creator,
+      name: nameResult.value,
+      symbol: symbolResult.value,
+      uri: uriResult.value,
+      virtualSolReserves,
+      virtualTokenReserves,
+    };
+  } catch {
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Main parser
 // ---------------------------------------------------------------------------
@@ -161,12 +256,20 @@ export function parseLaunchFromLogs(
   slot: number,
   signature: string,
 ): PumpfunLaunchEvent | null {
-  // Step 1: Find the 'Instruction: Create' log line.
+  // Step 1: Find the 'Instruction: Create(V2)' log line.
+  // CreateV2 (current default) must be checked first because
+  // 'Instruction: Create' is a substring of 'Instruction: CreateV2'.
   let createIndex = -1;
+  let isV2 = false;
   for (let i = 0; i < logs.length; i++) {
     const line = logs[i];
     if (line === undefined) continue;
-    if (line === CREATE_INSTRUCTION_LOG || line.includes('Instruction: Create')) {
+    if (line === CREATE_INSTRUCTION_LOG_V2) {
+      createIndex = i;
+      isV2 = true;
+      break;
+    }
+    if (line === CREATE_INSTRUCTION_LOG) {
       createIndex = i;
       break;
     }
@@ -181,6 +284,7 @@ export function parseLaunchFromLogs(
     slot,
     signature,
     logIndex: createIndex,
+    variant: isV2 ? 'V2' : 'legacy',
   });
 
   // Step 2: Scan subsequent log lines for event data.
@@ -192,7 +296,13 @@ export function parseLaunchFromLogs(
     // Check for base64 program data.
     if (line.startsWith(PROGRAM_DATA_PREFIX)) {
       const base64Data = line.slice(PROGRAM_DATA_PREFIX.length).trim();
-      const decoded = tryDecodeBase64EventData(base64Data);
+
+      // Try V2 layout first when this is a CreateV2 instruction
+      // (V2 is the current Pump.fun default; legacy is only kept as fallback
+      // for the rare case that V2 borsh parsing fails on a malformed tx).
+      const decoded = isV2
+        ? tryDecodeCreateV2EventData(base64Data) ?? tryDecodeBase64EventData(base64Data)
+        : tryDecodeBase64EventData(base64Data) ?? tryDecodeCreateV2EventData(base64Data);
       if (decoded) {
         logger.info('Parsed Pump.fun launch event from program data', {
           mint: decoded.mint,

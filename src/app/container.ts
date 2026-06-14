@@ -61,6 +61,7 @@ import type { PositionProvider } from '../risk/exposure/maxExposureGuard.js';
 import { CreatorBlacklist } from '../risk/blacklist/creatorBlacklist.js';
 import { TokenBlacklist } from '../risk/blacklist/tokenBlacklist.js';
 import { AntiRugMonitor } from '../risk/controls/antiRug.js';
+import { PostBuyMonitor } from '../risk/controls/postBuyMonitor.js';
 
 import { SolPriceOracle } from './solPriceOracle.js';
 
@@ -95,6 +96,8 @@ const logger = createLogger('app:container');
 export interface AppConfig {
   /** Helius API key (primary RPC). */
   readonly heliusApiKey: string;
+  /** Extra Helius API keys (each becomes a separate RPC endpoint at same priority for rotation/failover). */
+  readonly heliusExtraApiKeys: readonly string[];
   /** PublicNode RPC URL (fallback #1). */
   readonly publicNodeUrl: string;
   /** Alchemy API key (fallback #2, optional). */
@@ -168,6 +171,7 @@ export class ServiceContainer {
   private _jupiterVenue: JupiterVenue | null = null;
   private _solPriceOracle: SolPriceOracle | null = null;
   private _antiRugMonitor: AntiRugMonitor | null = null;
+  private _postBuyMonitor: PostBuyMonitor | null = null;
 
   constructor(config: AppConfig) {
     this.config = config;
@@ -181,6 +185,11 @@ export class ServiceContainer {
   /** Priority-ordered RPC pool: Helius > PublicNode > Alchemy. */
   get rpcPool(): RpcPool {
     if (this._rpcPool === null) {
+      // All Helius keys (primary + extras) sit at priority 0. The pool's health
+      // tracking moves to the next healthy Helius key when the current one
+      // 429s (3 consecutive failures → 30s cooldown). After cooldown the
+      // key is retried. This gives load-spreading + automatic failover across
+      // all 14 Helius keys without round-robin bookkeeping.
       const endpoints: RpcEndpointConfig[] = [
         {
           name: 'helius',
@@ -188,13 +197,23 @@ export class ServiceContainer {
           url: buildHeliusRpcUrl(this.config.heliusApiKey),
           timeoutMs: DEFAULT_RPC_HELIUS_TIMEOUT_MS,
         },
-        {
-          name: 'publicnode',
-          priority: 1,
-          url: this.config.publicNodeUrl,
-          timeoutMs: DEFAULT_RPC_PUBLICNODE_TIMEOUT_MS,
-        },
       ];
+
+      this.config.heliusExtraApiKeys.forEach((key, idx) => {
+        endpoints.push({
+          name: `helius-${idx + 2}`,
+          priority: 0,
+          url: buildHeliusRpcUrl(key),
+          timeoutMs: DEFAULT_RPC_HELIUS_TIMEOUT_MS,
+        });
+      });
+
+      endpoints.push({
+        name: 'publicnode',
+        priority: 1,
+        url: this.config.publicNodeUrl,
+        timeoutMs: DEFAULT_RPC_PUBLICNODE_TIMEOUT_MS,
+      });
 
       // Alchemy only if API key provided
       if (this.config.alchemyApiKey !== '') {
@@ -216,8 +235,8 @@ export class ServiceContainer {
     return this._rpcPool;
   }
 
-  /** RPC failover — wraps pool with automatic retry + health tracking. Internal use only. */
-  private get rpcFailover(): RpcFailover {
+  /** RPC failover — wraps pool with automatic retry + health tracking. */
+  get rpcFailover(): RpcFailover {
     if (this._rpcFailover === null) {
       this._rpcFailover = new RpcFailover(this.rpcPool);
     }
@@ -379,6 +398,13 @@ export class ServiceContainer {
       this._antiRugMonitor = new AntiRugMonitor(this.connection);
     }
     return this._antiRugMonitor;
+  }
+
+  get postBuyMonitor(): PostBuyMonitor {
+    if (this._postBuyMonitor === null) {
+      this._postBuyMonitor = new PostBuyMonitor(this.connection);
+    }
+    return this._postBuyMonitor;
   }
 
   // -----------------------------------------------------------------------

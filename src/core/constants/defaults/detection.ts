@@ -110,7 +110,7 @@ export const DEFAULT_MIN_TOKEN_AGE_SECONDS = 1200 as const;
  *   - Sweet spot for sniping: $5k-$30k mcap
  *   - Above $50k = likely already on Raydium or about to graduate
  */
-export const DEFAULT_MAX_BUY_MCAP_USD = 20_000 as const;
+export const DEFAULT_MAX_BUY_MCAP_USD = 25_000 as const;
 
 // ---------------------------------------------------------------------------
 // Wallet concentration

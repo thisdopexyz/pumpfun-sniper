@@ -64,14 +64,30 @@ function wrapError(method: string, err: unknown): never {
   );
 }
 
+// -------------------------------------------------------------------
+// Cache TTL for getLatestBlockhash. Blockhash is valid until
+// lastValidBlockHeight (~60-90s on Solana), so a 15s cache is safe and
+// cuts RPC call volume by ~10x during burst buy attempts.
+// -------------------------------------------------------------------
+const BLOCKHASH_CACHE_TTL_MS = 15_000;
+
 // ---------------------------------------------------------------------------
 // RpcClient
 // ---------------------------------------------------------------------------
 
 export class RpcClient {
+  /** Blockhash cache TTL — applied per-instance. */
+  static readonly BLOCKHASH_CACHE_TTL_MS = BLOCKHASH_CACHE_TTL_MS;
+
   private readonly connection: Connection;
   private readonly rateLimiter: RateLimiter;
   public readonly config: Readonly<RpcClientConfig>;
+
+  // Blockhash cache — see getLatestBlockhash() for rationale.
+  private cachedBlockhash: string | null = null;
+  private cachedBlockhashAt: number = 0;
+  private cachedBlockhashLastValidHeight: number = 0;
+  private cachedBlockhashLastValidAt: number = 0;
 
   constructor(config: RpcClientConfig) {
     this.config = Object.freeze({ ...config });
@@ -134,11 +150,34 @@ export class RpcClient {
     const method = 'getLatestBlockhash';
     const start = nowMs();
     try {
+      // Cache blockhash for BLOCKHASH_CACHE_TTL_MS. Solana blockhashes
+      // are valid for ~60-90s (until lastValidBlockHeight), so a 15s
+      // cache is safe and dramatically reduces RPC call volume during
+      // burst buy attempts (e.g., 3 momentum signals within seconds).
+      // Without this, the Helius free tier 429s because every buy
+      // attempt triggers a fresh getLatestBlockhash + 6 other RPC
+      // calls (mint/BC/metadata/largestAccounts/supply/slot).
+      if (
+        this.cachedBlockhash !== null &&
+        nowMs() - this.cachedBlockhashAt < RpcClient.BLOCKHASH_CACHE_TTL_MS &&
+        nowMs() < this.cachedBlockhashLastValidAt
+      ) {
+        return {
+          blockhash: this.cachedBlockhash,
+          lastValidBlockHeight: this.cachedBlockhashLastValidHeight,
+        };
+      }
       const result = await this.rateLimiter.execute(() =>
         this.connection.getLatestBlockhash(this.config.commitment as Commitment),
       );
       recordRpcCall(method, nowMs() - start);
       logger.debug('getLatestBlockhash', { method, blockhash: result.blockhash });
+      // Only cache if lastValidBlockHeight gives us >= 30s of validity
+      // (Solana produces ~2.5 slots/sec, so ~75 slots = 30s).
+      this.cachedBlockhash = result.blockhash;
+      this.cachedBlockhashAt = nowMs();
+      this.cachedBlockhashLastValidHeight = result.lastValidBlockHeight;
+      this.cachedBlockhashLastValidAt = result.lastValidBlockHeight * 400; // ~400ms/slot
       return { blockhash: result.blockhash, lastValidBlockHeight: result.lastValidBlockHeight };
     } catch (err: unknown) {
       recordRpcError(method, classifyError(err));
@@ -205,6 +244,42 @@ logger.debug('getAccountInfo', { method, pubkey: pubkey.toBase58(), found: info 
     } catch (err: unknown) {
       recordRpcError(method, classifyError(err));
       logger.error('getAccountInfo failed', { method, err: String(err) });
+      wrapError(method, err);
+    }
+  }
+
+  async getTokenLargestAccounts(
+    mint: PublicKey,
+  ): Promise<{ readonly value: readonly { readonly address: PublicKey; readonly amount: string; readonly uiAmount: number | null; readonly uiAmountString?: string; readonly decimals: number }[] } | null> {
+    const method = 'getTokenLargestAccounts';
+    const start = nowMs();
+    try {
+      const result = await this.rateLimiter.execute(() =>
+        this.connection.getTokenLargestAccounts(mint, this.config.commitment as Commitment),
+      );
+      recordRpcCall(method, nowMs() - start);
+      return result;
+    } catch (err: unknown) {
+      recordRpcError(method, classifyError(err));
+      logger.error('getTokenLargestAccounts failed', { method, err: String(err) });
+      wrapError(method, err);
+    }
+  }
+
+  async getTokenSupply(
+    mint: PublicKey,
+  ): Promise<{ readonly context: { readonly slot: number }; readonly value: { readonly amount: string; readonly decimals: number; readonly uiAmount: number | null; readonly uiAmountString?: string } } | null> {
+    const method = 'getTokenSupply';
+    const start = nowMs();
+    try {
+      const result = await this.rateLimiter.execute(() =>
+        this.connection.getTokenSupply(mint, this.config.commitment as Commitment),
+      );
+      recordRpcCall(method, nowMs() - start);
+      return result;
+    } catch (err: unknown) {
+      recordRpcError(method, classifyError(err));
+      logger.error('getTokenSupply failed', { method, err: String(err) });
       wrapError(method, err);
     }
   }

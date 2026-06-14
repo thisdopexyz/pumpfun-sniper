@@ -56,6 +56,12 @@ export interface PositionData {
   readonly highestPriceLamports?: bigint;
   /** Anti-rug monitor detected a suspicious dump by a top holder. */
   readonly antiRugTriggered?: boolean;
+  /** Post-buy monitor: volume drop detected. */
+  readonly volumeDropTriggered?: boolean;
+  /** Post-buy monitor: dev wallet selling detected. */
+  readonly devSellTriggered?: boolean;
+  /** Post-buy monitor: holder count drop detected. */
+  readonly holderDropTriggered?: boolean;
   /** Which scale-out tiers have already been sold (by index). */
   readonly scaleOutTiersCompleted?: readonly number[];
 }
@@ -250,6 +256,52 @@ export function evaluateExit(data: PositionData): ExitDecisionResult {
       pnlPercent,
       elapsedMs,
       explanation: 'Anti-rug triggered: suspicious large dump detected by top holder',
+    };
+  }
+
+  // --- Check 2.6: Post-buy monitors ---
+  if (data.volumeDropTriggered) {
+    logger.warn('Exit decision: VOLUME_DROP triggered', {
+      tradeId: data.tradeId,
+      mint: data.mint,
+      pnlPercent: pnlPercent.toFixed(2),
+    });
+    return {
+      shouldExit: true,
+      reason: 'ANTI_RUG',
+      pnlPercent,
+      elapsedMs,
+      explanation: 'Post-buy: volume dropped 80%+ — likely rug',
+    };
+  }
+
+  if (data.devSellTriggered) {
+    logger.warn('Exit decision: DEV_SELL triggered', {
+      tradeId: data.tradeId,
+      mint: data.mint,
+      pnlPercent: pnlPercent.toFixed(2),
+    });
+    return {
+      shouldExit: true,
+      reason: 'ANTI_RUG',
+      pnlPercent,
+      elapsedMs,
+      explanation: 'Post-buy: dev wallet selling — exit immediately',
+    };
+  }
+
+  if (data.holderDropTriggered) {
+    logger.warn('Exit decision: HOLDER_DROP triggered', {
+      tradeId: data.tradeId,
+      mint: data.mint,
+      pnlPercent: pnlPercent.toFixed(2),
+    });
+    return {
+      shouldExit: true,
+      reason: 'ANTI_RUG',
+      pnlPercent,
+      elapsedMs,
+      explanation: 'Post-buy: holder count dropped 30%+ — mass exodus',
     };
   }
 

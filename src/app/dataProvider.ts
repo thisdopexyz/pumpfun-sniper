@@ -15,6 +15,7 @@ import type { WalletAddress } from '../core/types/wallet.js';
 import type { PositionRegistry } from '../core/state/positionRegistry.js';
 import { getAssociatedTokenAddressSync, TOKEN_PROGRAM_ID } from '@solana/spl-token';
 import type { AntiRugMonitor } from '../risk/controls/antiRug.js';
+import { PostBuyMonitor } from '../risk/controls/postBuyMonitor.js';
 import { createLogger } from '../telemetry/logging/logger.js';
 import { deriveBondingCurvePDA } from '../adapters/protocols/pumpfun/shared.js';
 import { parseBondingCurveData } from '../adapters/protocols/pumpfun/tokenParser.js';
@@ -37,9 +38,31 @@ import {
   evaluateLaunchProvenance,
   evaluateMetadata,
   evaluateConcentration,
+  checkMetadataFields,
 } from './entryCheckEvaluator.js';
 
 const logger = createLogger('main:dataProvider');
+
+/**
+ * Race a promise against a timeout. If the promise doesn't resolve by `ms`,
+ * the returned promise rejects with a labeled Error. The underlying promise
+ * is NOT cancelled (JS has no cancellation) — it just stops blocking the
+ * caller and prevents slot/counter leaks.
+ *
+ * Used to ensure `getEntryCheckData` always returns within bounded time,
+ * which is the precondition for the strategy's `pendingBuyCount` to
+ * decrement. Without this, a single hung RPC endpoint can wedge the
+ * entire strategy queue forever.
+ */
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms);
+  });
+  return Promise.race([p, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
 
 /** Cached SOL price with fallback — prevents oracle outage from disabling checks 10/17/18. */
 let cachedSolPriceUsd: number = SOL_FALLBACK_PRICE_USD;
@@ -100,6 +123,7 @@ const graduationPriceRatio = new Map<string, bigint>();
 
 /** Anti-rug triggered flags per mint (set by AntiRugMonitor callback). */
 const antiRugTriggeredMints = new Set<string>();
+const postBuyTriggeredMints = new Map<string, string>();
 
 /** Jupiter price cache per mint (price in SOL per raw token). Avoids hammering API every 1s poll. */
 const graduatedPriceCache = new Map<string, { priceLamports: bigint; fetchedAt: number }>();
@@ -247,6 +271,7 @@ export function createDataProvider(
   positionRegistry: PositionRegistry,
   detectors?: { bundleDetector?: { getLatestBundlePct(mint: string): number | null; forceAnalyze(mint: string): number | null }; washTradeDetector?: { getLatestWashScore(mint: string): number | null; forceAnalyze(mint: string): number | null }; smartMoneyDetector?: { checkSmartMoney(mint: string): { smartMoneyScore: number; smartWalletCount: number } | null }; walletAgeDetector?: { getLatestScore(mint: string): number | null; forceAnalyze(mint: string): number | null }; buyVelocityAnalyzer?: { getLatestScore(mint: string): number | null; forceAnalyze(mint: string): number | null }; crossTokenCorrelator?: { getLatestScore(mint: string): number | null; forceAnalyze(mint: string): number | null } },
   antiRugMonitor?: AntiRugMonitor,
+  postBuyMonitor?: PostBuyMonitor,
 ): StrategyDataProvider {
   const conn = container.connection;
 
@@ -284,6 +309,20 @@ export function createDataProvider(
       antiRugTriggeredMints.delete(mint);
     },
 
+    startPostBuyMonitoring(mint: string, devWallet: string | null): void {
+      if (!postBuyMonitor) return;
+      postBuyMonitor.startMonitoring(mint, devWallet, (detectedMint: string, reason: string, details: string) => {
+        postBuyTriggeredMints.set(detectedMint, reason);
+        logger.warn('Post-buy exit triggered', { mint: detectedMint.slice(0, 12), reason, details });
+      });
+    },
+
+    stopPostBuyMonitoring(mint: string): void {
+      if (!postBuyMonitor) return;
+      postBuyMonitor.stopMonitoring(mint);
+      postBuyTriggeredMints.delete(mint);
+    },
+
     transitionPosition(tradeId: string, to: string, reason: string): void {
       positionRegistry.transition(tradeId, to as any, reason);
     },
@@ -291,21 +330,92 @@ export function createDataProvider(
     async getEntryCheckData(signal: Signal): Promise<EntryCheckData> {
       const mint = signal.mint;
       const mintPk = new PublicKey(mint);
+      // Fetch mint account via the multi-RPC failover. Trying a single
+      // Helius endpoint can return an empty buffer for newly-propagated
+      // mints (different Helius nodes have different propagation timing).
+      // RpcFailover iterates all 15 endpoints until one returns a real
+      // mint account with sufficient data.
+      // Fetch mint account concurrently with the other parallel fetches.
+      // Previously awaited mintAccount first (8s) THEN started the parallel
+      // fetches (another 6s) = 14s minimum, exceeding the 12s safety net.
+      // Now mintAccount is just one slot in the parallel array so all 7
+      // fetches race together — total is max(8s, 6s, 6s, ...) = 8s.
+      const mintAccountPromise = withTimeout(
+        container.rpcFailover.execute(async (client) => {
+          const acc = await client.getAccountInfo(mintPk);
+          if (acc !== null && acc.data.length >= 82) {
+            return acc;
+          }
+          throw new Error(`mint account empty or missing (data=${acc?.data.length ?? 0}B)`);
+        }),
+        8_000,
+        'rpcFailover.mintAccount',
+      ).catch((err) => {
+        // All 15 endpoints exhausted — fall through with null, evaluateAuthority
+        // will warn and default to unsafe (existing behavior, BLOCK).
+        logger.warn('All RPC endpoints returned empty mint account', {
+          mint: mint.slice(0, 12),
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return null;
+      });
+      // Each fetch wrapped in withTimeout so a single hung RPC endpoint
+      // (rpcFailover has no internal timeout) cannot wedge getEntryCheckData
+      // forever. If a fetch times out, its slot in Promise.allSettled becomes
+      // 'rejected' and downstream code treats it as null/missing.
       const results = await Promise.allSettled([
-        // Fetch 1: Token Mint account (authority checks)
-        conn.getAccountInfo(mintPk),
-        // Fetch 2: Bonding curve account (liquidity + creator fallback)
-        conn.getAccountInfo(deriveBondingCurvePDA(mintPk)),
+        // Fetch 1: Mint account — fetched concurrently with the others
+        // (see mintAccountPromise above). Resolves to AccountInfo or null.
+        mintAccountPromise,
+        // Fetch 2: Bonding curve account — wrap in failover so a single
+        // slow Helius endpoint doesn't return null for fresh mints.
+        withTimeout((async () => {
+          try {
+            return await container.rpcFailover.execute(async (client) => {
+              const acc = await client.getAccountInfo(deriveBondingCurvePDA(mintPk));
+              if (acc !== null && acc.data.length >= 49) return acc;
+              throw new Error('BC account empty');
+            });
+          } catch { return null; }
+        })(), 6_000, 'fetch.bondingCurve'),
         // Fetch 3: Metaplex metadata account (metadata check)
-        conn.getAccountInfo(deriveMetadataPDA(mintPk)),
+        withTimeout((async () => {
+          try {
+            return await container.rpcFailover.execute(async (client) => {
+              const acc = await client.getAccountInfo(deriveMetadataPDA(mintPk));
+              if (acc !== null && acc.data.length >= 100) return acc;
+              throw new Error('metadata account empty');
+            });
+          } catch { return null; }
+        })(), 6_000, 'fetch.metadata'),
         // Fetch 4: Token largest accounts (wallet concentration)
-        conn.getTokenLargestAccounts(mintPk),
+        withTimeout((async () => {
+          try {
+            return await container.rpcFailover.execute(async (client) => {
+              return await client.getTokenLargestAccounts(mintPk);
+            });
+          } catch { return null; }
+        })(), 6_000, 'fetch.largestAccounts'),
         // Fetch 5: Token supply
-        conn.getTokenSupply(mintPk),
+        withTimeout((async () => {
+          try {
+            return await container.rpcFailover.execute(async (client) => {
+              return await client.getTokenSupply(mintPk);
+            });
+          } catch { return null; }
+        })(), 6_000, 'fetch.tokenSupply'),
         // Fetch 6: Previously persisted signals for launch provenance
-        container.signalRepository.findByMint(mint),
+        withTimeout(container.signalRepository.findByMint(mint), 3_000, 'fetch.signalHistory'),
         // Fetch 7: BonkFun/LaunchLab pool state (venue-aware liquidity + price)
-        conn.getAccountInfo(derivePoolStatePDA(mintPk)),
+        withTimeout((async () => {
+          try {
+            return await container.rpcFailover.execute(async (client) => {
+              const acc = await client.getAccountInfo(derivePoolStatePDA(mintPk));
+              if (acc !== null && acc.data.length >= 200) return acc;
+              throw new Error('pool state empty');
+            });
+          } catch { return null; }
+        })(), 6_000, 'fetch.poolState'),
       ]);
 
       const signalsForMint = results[5].status === 'fulfilled' ? results[5].value : [];
@@ -319,15 +429,43 @@ export function createDataProvider(
       const launchSignals = signalsForMint.filter((item): item is LaunchSignal => item.type === 'LAUNCH');
       const latestLaunch = launchSignals[launchSignals.length - 1] ?? null;
 
-      const mintAccount = results[0].status === 'fulfilled' ? results[0].value : null;
-      const { mintAuthorityRevoked, freezeAuthorityRevoked } = evaluateAuthority(mint, mintAccount);
-
+      const mintAccountResolved = results[0].status === 'fulfilled' ? results[0].value : null;
+      const { mintAuthorityRevoked, freezeAuthorityRevoked } = evaluateAuthority(mint, mintAccountResolved);
       const bondingCurveAccount = results[1].status === 'fulfilled' ? results[1].value : null;
       const poolStateAccount = results[6].status === 'fulfilled' ? results[6].value : null;
       const { liquiditySane, bondingCurveCreator } = evaluateLiquidity(bondingCurveAccount, poolStateAccount);
 
       const creatorAddress = (latestLaunch?.creator ?? bondingCurveCreator) as WalletAddress | null;
-      const launchDetected = evaluateLaunchProvenance(launchSignals, liquiditySane, creatorAddress);
+      let launchDetected = evaluateLaunchProvenance(launchSignals, liquiditySane, creatorAddress);
+
+      // Race-condition fallback: launch signal not yet persisted to DB when
+      // momentum signal fires (signalRepository.findByMint is async). Confirm
+      // the mint exists on PumpFun via the frontend API and treat it as a
+      // valid launch. Same endpoint used for created_timestamp fallback below.
+      if (!launchDetected) {
+        try {
+          const pfRes = await withTimeout(
+            fetch(
+              `https://frontend-api-v3.pump.fun/coins/${mint}`,
+              { signal: AbortSignal.timeout(3000) },
+            ),
+            4_000,
+            'pumpfunApi.launchDetect',
+          );
+          if (pfRes.ok) {
+            const pfData = await pfRes.json() as { mint?: string; creator?: string };
+            if (pfData.mint === mint) {
+              launchDetected = true;
+              logger.debug('Launch detected via PumpFun API race-condition fallback', {
+                mint: mint.slice(0, 12),
+                creator: pfData.creator?.slice(0, 12),
+              });
+            }
+          }
+        } catch {
+          // Non-blocking — fall through with launchDetected=false
+        }
+      }
 
       // --- Check 2: Creator not blacklisted ---
       const creatorNotBlacklisted = creatorAddress !== null
@@ -339,9 +477,13 @@ export function createDataProvider(
       let creatorLaunchCount = 0;
       if (creatorAddress !== null) {
         try {
-          const launches = await container.signalRepository.findRecentLaunchesByCreator(
-            creatorAddress,
-            signal.timestamp - CREATOR_HISTORY_WINDOW_MS,
+          const launches = await withTimeout(
+            container.signalRepository.findRecentLaunchesByCreator(
+              creatorAddress,
+              signal.timestamp - CREATOR_HISTORY_WINDOW_MS,
+            ),
+            3_000,
+            'fetch.creatorHistory',
           );
           creatorLaunchCount = launches.length;
           creatorHistoryAcceptable = creatorLaunchCount <= CREATOR_HISTORY_MAX_LAUNCHES;
@@ -356,7 +498,41 @@ export function createDataProvider(
       }
 
       const metadataAccount = results[2].status === 'fulfilled' ? results[2].value : null;
-      const { metadataSane, parsed: metadataParsed } = evaluateMetadata(mint, metadataAccount, mintAccount);
+      let { metadataSane, parsed: metadataParsed } = evaluateMetadata(mint, metadataAccount, mintAccountResolved);
+
+      // Pump.fun CreateV2 uses Token-2022 with metadata-pointer extension,
+      // not embedded metadata. The local Token-2022 parser is heuristic
+      // and often fails. Fall back to the PumpFun frontend API which has
+      // the canonical name/symbol for every pump.fun token.
+      if (!metadataSane) {
+        try {
+          const pfRes = await withTimeout(
+            fetch(
+              `https://frontend-api-v3.pump.fun/coins/${mint}`,
+              { signal: AbortSignal.timeout(3000) },
+            ),
+            4_000,
+            'pumpfunApi.metadata',
+          );
+          if (pfRes.ok) {
+            const pfData = await pfRes.json() as { name?: string; symbol?: string; uri?: string; mint?: string };
+            if (pfData.mint === mint && pfData.name && pfData.symbol) {
+              const pfMetadata = { name: pfData.name, symbol: pfData.symbol, uri: pfData.uri ?? '' };
+              metadataSane = checkMetadataFields(pfMetadata);
+              metadataParsed = pfMetadata;
+              logger.debug('Metadata from PumpFun API fallback', {
+                mint: mint.slice(0, 12),
+                name: pfData.name,
+                symbol: pfData.symbol,
+                sane: metadataSane,
+              });
+            }
+          }
+        } catch {
+          // Non-blocking — fall through with metadataSane=false
+        }
+      }
+
       if (metadataParsed) {
         metadataCache.set(mint, metadataParsed);
       }
@@ -427,7 +603,11 @@ export function createDataProvider(
       let priceImpactBps: number | null = null;
       if (parsedBC && parsedBC.virtualSolReserves > 0n) {
         try {
-          const solPriceUsd = await getSolPriceWithFallback(container.solPriceOracle);
+          const solPriceUsd = await withTimeout(
+            getSolPriceWithFallback(container.solPriceOracle),
+            3_000,
+            'fetch.solPrice.impact',
+          );
           const positionSizeLamports = computePositionSizeLamports(solPriceUsd);
           // virtualSolReserves is in lamports (PumpFun confirmed)
           priceImpactBps = Number(positionSizeLamports * 10000n) / Number(parsedBC.virtualSolReserves + positionSizeLamports);
@@ -440,7 +620,11 @@ export function createDataProvider(
       } else if (parsedPool && parsedPool.virtualQuote > 0n) {
         // BonkFun price impact: use virtualQuote (SOL reserves)
         try {
-          const solPriceUsd = await getSolPriceWithFallback(container.solPriceOracle);
+          const solPriceUsd = await withTimeout(
+            getSolPriceWithFallback(container.solPriceOracle),
+            3_000,
+            'fetch.solPrice.impact.bonk',
+          );
           const positionSizeLamports = computePositionSizeLamports(solPriceUsd);
           priceImpactBps = Number(positionSizeLamports * 10000n) / Number(parsedPool.virtualQuote + positionSizeLamports);
         } catch (err: unknown) {
@@ -455,7 +639,11 @@ export function createDataProvider(
       let creatorScore: number | null = null;
       if (creatorAddress !== null) {
         try {
-          creatorScore = await container.creatorStatsRepository.getScore(creatorAddress);
+          creatorScore = await withTimeout(
+            container.creatorStatsRepository.getScore(creatorAddress),
+            3_000,
+            'fetch.creatorScore',
+          );
         } catch (err: unknown) {
           logger.warn('Failed to load creator score', {
             mint: mint.slice(0, 12),
@@ -472,7 +660,11 @@ export function createDataProvider(
       if (launchTimestamp === null) {
         try {
           const pfUrl = `https://frontend-api-v3.pump.fun/coins/${mint}`;
-          const pfRes = await fetch(pfUrl, { signal: AbortSignal.timeout(3000) });
+          const pfRes = await withTimeout(
+            fetch(pfUrl, { signal: AbortSignal.timeout(3000) }),
+            4_000,
+            'pumpfunApi.launchTimestamp',
+          );
           if (pfRes.ok) {
             const pfData = await pfRes.json() as { created_timestamp?: number | string };
             if (pfData.created_timestamp) {
@@ -506,7 +698,11 @@ export function createDataProvider(
           const pricePerTokenLamports = computeBondingCurvePriceScaled(parsedBC.virtualSolReserves, parsedBC.virtualTokenReserves);
           const totalSupplyRaw = BigInt(supply.value.amount);
           const marketCapLamports = pricePerTokenLamports * totalSupplyRaw;
-          const solPriceUsd = await getSolPriceWithFallback(container.solPriceOracle);
+          const solPriceUsd = await withTimeout(
+            getSolPriceWithFallback(container.solPriceOracle),
+            3_000,
+            'fetch.solPrice.mcap',
+          );
           // pricePerTokenScaled is in (lamports * 10^6) / raw_token units.
           // marketCapLamports = priceScaled * supply → in (lamports * 10^6) units.
           // To get SOL: /10^6 (undo scaling) / 10^9 (lamports→SOL) = /10^15
@@ -522,7 +718,11 @@ export function createDataProvider(
         try {
           const totalSupplyRaw = BigInt(supply.value.amount);
           const marketCapLamports = (parsedPool.virtualQuote * totalSupplyRaw) / parsedPool.virtualBase;
-          const solPriceUsd = await getSolPriceWithFallback(container.solPriceOracle);
+          const solPriceUsd = await withTimeout(
+            getSolPriceWithFallback(container.solPriceOracle),
+            3_000,
+            'fetch.solPrice.mcap.bonk',
+          );
           // virtualQuote is in 10-lamport units. Actual SOL = virtualQuote / 10 / 10^9
           marketCapUsd = Number(marketCapLamports / 10n ** 10n) * solPriceUsd;
         } catch (err: unknown) {
@@ -579,13 +779,34 @@ export function createDataProvider(
         // Both PumpFun realSolReserves and BonkFun realQuote are in lamports
         realSolReservesLamports: parsedBC ? parsedBC.realSolReserves : (parsedPool ? parsedPool.realQuote : null),
         // Check 16: Real holder count from Helius API (not just top 20)
-        holderCount: await getRealHolderCount(mint, container.heliusApiKey).catch(() => largestAccounts?.value?.length ?? null),
+        // Wrap in withTimeout — function uses paginated fetches (5s/page
+        // timeout) but with many holders can still take 10+ seconds.
+        // Fallback chain (each tier less accurate but more reliable):
+        //   1. getRealHolderCount (paginated, exact count, slow)
+        //   2. filteredLargestAccounts.length (excludes BC ATA/PDA — the
+        //      "real" top holders; this is the same array used for
+        //      concentration check, already fetched in parallel)
+        //   3. largestAccounts.value.length (raw top-20 from getTokenLargestAccounts
+        //      — may include BC ATA but at least 20 means >=20 holders)
+        // getTokenLargestAccounts returns at most 20 accounts, so a return
+        // value of 20 means there are >=20 holders (lower bound). Returning
+        // null here would BLOCK with "Holder count unavailable" even when
+        // we have positive evidence of >= 20 holders.
+        holderCount: await withTimeout(
+          getRealHolderCount(mint, container.heliusApiKey),
+          10_000,
+          'fetch.holderCount',
+        ).catch(() => null) ?? filteredLargestAccounts?.length ?? largestAccounts?.value?.length ?? null,
         // Check 18: Volume in USD — try DexScreener first, fallback to momentum window
-        volumeUsd: await getRealVolume1h(mint).catch(() => null)
+        volumeUsd: await withTimeout(getRealVolume1h(mint), 6_000, 'fetch.volume1h').catch(() => null)
           ?? await (async () => {
             if (Number(volumeLamports) <= 0) return undefined;
             try {
-              const solPrice = await getSolPriceWithFallback(container.solPriceOracle);
+              const solPrice = await withTimeout(
+                getSolPriceWithFallback(container.solPriceOracle),
+                3_000,
+                'fetch.solPrice.volume',
+              );
               return Number(volumeLamports) / 1e9 * solPrice;
             } catch { return undefined; }
           })(),
@@ -811,6 +1032,9 @@ export function createDataProvider(
         graduated,
         highestPriceLamports,
         antiRugTriggered: antiRugTriggeredMints.has(pos.mint),
+        volumeDropTriggered: postBuyTriggeredMints.get(pos.mint) === 'VOLUME_DROP',
+        devSellTriggered: postBuyTriggeredMints.get(pos.mint) === 'DEV_SELL',
+        holderDropTriggered: postBuyTriggeredMints.get(pos.mint) === 'HOLDER_DROP',
       };
     },
 

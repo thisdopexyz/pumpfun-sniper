@@ -54,6 +54,7 @@ export interface PumpfunSellEvent {
 
 /** Log patterns used to identify Pump.fun instruction types */
 const INSTRUCTION_LOG_PATTERNS: ReadonlyMap<string, PumpfunEventType> = new Map([
+  ['Program log: Instruction: CreateV2', 'CREATE'],
   ['Program log: Instruction: Create', 'CREATE'],
   ['Program log: Instruction: Buy', 'BUY'],
   ['Program log: Instruction: Sell', 'SELL'],

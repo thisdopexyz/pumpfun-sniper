@@ -31,18 +31,41 @@ const logger = createLogger('app:bootstrap');
  * Load configuration from environment variables.
  *
  * Required env vars:
- *   - HELIUS_API_KEY (primary RPC)
+ *   - HELIUS_EXTRA_KEYS (comma-separated Helius API keys; first one used for WS)
  *   - DATABASE_URL
  *   - REDIS_URL
  *   - WALLET_SECRET_KEY (base64-encoded 64-byte secret key)
  *
  * Optional env vars:
+ *   - HELIUS_API_KEY (legacy: if set, used as primary; otherwise first extra key)
  *   - PUBLICNODE_RPC_URL (default: https://solana-rpc.publicnode.com)
  *   - ALCHEMY_API_KEY (empty = disabled)
- *   - SOLANA_WS_URL (default: wss://mainnet.helius-rpc.com/?api-key=<HELIUS_KEY>)
+ *   - SOLANA_WS_URL (default: wss://mainnet.helius-rpc.com/?api-key=<primary key>)
+ *
+ * The legacy HELIUS_API_KEY was removed because Helius free tier keys share
+ * a single per-account rate limit. Rotating across multiple keys (HELIUS_EXTRA_KEYS)
+ * gives much higher throughput. Set HELIUS_API_KEY only if you have a dedicated
+ * paid key and want it pinned as primary.
  */
 function loadConfig(): AppConfig {
-  const heliusApiKey = requireEnv('HELIUS_API_KEY');
+  const legacyPrimaryKey = process.env['HELIUS_API_KEY'];
+  const heliusExtraApiKeysRaw = (process.env['HELIUS_EXTRA_KEYS'] ?? '')
+    .split(',')
+    .map((k) => k.trim())
+    .filter((k) => k.length > 0);
+
+  if (heliusExtraApiKeysRaw.length === 0) {
+    throw new Error('HELIUS_EXTRA_KEYS missing — provide at least one Helius API key');
+  }
+
+  // If legacy HELIUS_API_KEY is set and is NOT already in the extras list,
+  // use it as the primary (prepended) so it gets the WS slot.
+  // Otherwise the first extra key is the primary.
+  const heliusApiKey = (legacyPrimaryKey && !heliusExtraApiKeysRaw.includes(legacyPrimaryKey))
+    ? legacyPrimaryKey
+    : heliusExtraApiKeysRaw[0]!;
+
+  const heliusExtraApiKeys = heliusExtraApiKeysRaw.filter((k) => k !== heliusApiKey);
   const publicNodeUrl = optionalEnv('PUBLICNODE_RPC_URL', 'https://solana-rpc.publicnode.com');
   const alchemyApiKey = optionalEnv('ALCHEMY_API_KEY', '');
   const wsUrl = optionalEnv('SOLANA_WS_URL', `wss://mainnet.helius-rpc.com/?api-key=${heliusApiKey}`);
@@ -63,6 +86,7 @@ function loadConfig(): AppConfig {
 
   logger.info('Config loaded from environment', {
     rpcPrimary: 'helius',
+    rpcHeliusExtras: heliusExtraApiKeys.length,
     rpcFallback1: 'publicnode',
     rpcFallback2: alchemyApiKey !== '' ? 'alchemy' : 'disabled',
     postgresUrl: '<redacted>',
@@ -71,6 +95,7 @@ function loadConfig(): AppConfig {
 
   return {
     heliusApiKey,
+    heliusExtraApiKeys,
     publicNodeUrl,
     alchemyApiKey,
     wsUrl,

@@ -40,6 +40,7 @@ import {
   MAX_PRICE_IMPACT_BPS,
   MIN_CREATOR_SCORE,
   MAX_WASH_TRADE_SCORE,
+  MAX_BUNDLE_PCT,
   MIN_UNIQUE_WALLETS,
   MAX_SELL_RATIO_PCT,
   MIN_LIQUIDITY_DEPTH_LAMPORTS,
@@ -282,6 +283,10 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
         : 'High wallet concentration detected (whale risk)',
     },
     // Check 9: Momentum threshold met (buy count + volume + window)
+    // NOTE: Check 13 (unique_wallets min 20) is stricter than this check's
+    // min_buy_count (15). Momentum can fire with 15 buys, but if those buys
+    // come from < 20 unique wallets, Check 13 will block. This is intentional:
+    // momentum alone doesn't guarantee wallet diversity.
     (() => {
       const buyCountOk = data.buyCountInWindow >= MOMENTUM_MIN_BUYS;
       const windowOk = data.windowMs <= MOMENTUM_WINDOW_MS;
@@ -329,6 +334,21 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
           : `WASH TRADE SUSPECTED: score ${data.washTradeScore.toFixed(0)}/100 (max 60)`,
       };
     })(),
+    // Check 11: Bundle percentage acceptable (60s window — single-multi-wallet scheme)
+    // BLOCK if data unavailable — anti-scam check requires data
+    (() => {
+      if (data.bundlePct == null) {
+        return { name: 'bundle_pct', passed: false, reason: 'Bundle % unavailable — BLOCKING (anti-scam check requires data)' };
+      }
+      const passed = data.bundlePct <= MAX_BUNDLE_PCT;
+      return {
+        name: 'bundle_pct',
+        passed,
+        reason: passed
+          ? `Bundle OK: ${data.bundlePct.toFixed(1)}% (max ${MAX_BUNDLE_PCT}%)`
+          : `BUNDLE DETECTED: ${data.bundlePct.toFixed(1)}% of supply from clustered wallets (max ${MAX_BUNDLE_PCT}%) — likely dev multi-wallet scheme`,
+      };
+    })(),
     // Check 13: Unique wallets in momentum window (min 12)
     // BLOCK if data unavailable — wallet diversity is critical for anti-manipulation
     (() => {
@@ -346,7 +366,8 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
     })(),
     // Check 14: Sell pressure acceptable (early dump detection)
     // If sells > 60% of total trades, it's likely a dump
-    // Buy window: 30s (momentum), Sell window: 60s (2x ratio)
+    // Both buy and sell counts use the SAME momentum window (30s)
+    // to avoid ratio inflation from mismatched windows
     (() => {
       if (data.sellCountInWindow === undefined) {
         return { name: 'sell_pressure', passed: true, reason: 'Sell pressure tracking not yet active — skipping' };
@@ -423,9 +444,9 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
       // Mcap-based tiers (looser for lower mcap, tighter for higher)
       const mcap = data.marketCapUsd;
       const ratio = data.holderCount / mcap;
-      const maxRatio = mcap < 5000 ? 0.05 :
-                       mcap < 10000 ? 0.03 :
-                       0.015;
+      const maxRatio = mcap < 2000 ? 0.02 :
+                       mcap < 5000 ? 0.015 :
+                       mcap < 10000 ? 0.01 : 0.008;
       const passed = ratio <= maxRatio;
       return {
         name: 'holder_mcap_ratio',
@@ -600,11 +621,60 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
     );
   }
 
+  // Soft-fail classification: a check is "soft" if failing it doesn't
+  // necessarily mean the token is a scam — it usually means the data
+  // isn't available yet, or the token is a borderline case on a strict
+  // threshold. "Hard" checks are non-negotiable anti-scam gates.
+  //
+  // A token is ALLOWED if it has zero hard failures AND <= SOFT_FAIL_TOLERANCE
+  // soft failures. This lets the bot snipe tokens that are 24-25/26 in
+  // practice (data race / strict count off by one) while still blocking
+  // real scams (bundle, dev multi-wallet, blacklist, rug risk).
+  //
+  // Classification rationale:
+  //   HARD = real anti-scam signal where failing = high rug risk:
+  //     - bundle_pct, wash_trade_check, enhanced_bundle_pct: dev multi-wallet
+  //     - creator_not_blacklisted: KNOWN scammer (DB-confirmed)
+  //     - liquidity_sane, momentum_threshold_met: structural (BC must exist, must have momentum)
+  //   SOFT = heuristic / data-quality / borderline:
+  //     - creator_history (serial launcher) — heuristic, not a scam signal per se
+  //     - wallet_concentration — popular launches can have concentration
+  //     - mint/freeze authority — not all tokens revoke (pump.fun pattern)
+  //     - data-quality checks (holder count, unique wallets, mcap, etc.)
+  //     - analytics boosters (smart money, cross-token, etc.)
+  const HARD_FAIL_NAMES = new Set([
+    'launch_detected',
+    'creator_not_blacklisted',
+    'metadata_sane',
+    'liquidity_sane',
+    'momentum_threshold_met',
+    'wash_trade_check',
+    'bundle_pct',
+    'enhanced_bundle_pct',
+  ]);
+
+  const SOFT_FAIL_TOLERANCE = 3; // allow up to 3 soft fails when all hard pass
+
   const passedCount = checks.filter((c) => c.passed).length;
   const failedCount = checks.length - passedCount;
   const firstFailure = checks.find((c) => !c.passed);
 
-  const allowed = failedCount === 0;
+  const failures = checks.filter((c) => !c.passed);
+  const hardFailures = failures.filter((c) => HARD_FAIL_NAMES.has(c.name));
+  const softFailures = failures.filter((c) => !HARD_FAIL_NAMES.has(c.name));
+
+  const allowed = hardFailures.length === 0 && softFailures.length <= SOFT_FAIL_TOLERANCE;
+
+  if (allowed && softFailures.length > 0) {
+    logger.info('Entry decision: ALLOWED via soft-fail tolerance', {
+      mint: data.mint,
+      passedCount,
+      failedCount,
+      hardFails: hardFailures.length,
+      softFails: softFailures.length,
+      softFailNames: softFailures.map((c) => c.name),
+    });
+  }
 
   if (allowed) {
     logger.info('Entry decision: ALLOWED', {
@@ -623,6 +693,8 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
       mint: data.mint,
       passedCount,
       failedCount,
+      hardFails: hardFailures.length,
+      softFails: softFailures.length,
       firstFailure: firstFailure?.name ?? 'unknown',
       firstFailureReason: firstFailure?.reason ?? 'unknown',
     });

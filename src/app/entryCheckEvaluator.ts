@@ -44,11 +44,22 @@ export function evaluateAuthority(
 ): { mintAuthorityRevoked: boolean; freezeAuthorityRevoked: boolean } {
   if (mintAccount?.data && mintAccount.data.length >= 82) {
     const authority = AuthorityInspector.parseMintBuffer(mint, mintAccount.data as Buffer);
+    logger.debug('Authority evaluated', {
+      mint: mint.slice(0, 12),
+      dataLength: mintAccount.data.length,
+      mintAuthRevoked: authority.mintAuthorityRevoked,
+      freezeAuthRevoked: authority.freezeAuthorityRevoked,
+    });
     return {
       mintAuthorityRevoked: authority.mintAuthorityRevoked,
       freezeAuthorityRevoked: authority.freezeAuthorityRevoked,
     };
   }
+  logger.warn('Mint account not available for authority check', {
+    mint: mint.slice(0, 12),
+    hasAccount: mintAccount !== null,
+    dataLength: mintAccount?.data.length ?? 0,
+  });
   return { mintAuthorityRevoked: false, freezeAuthorityRevoked: false };
 }
 
@@ -126,7 +137,7 @@ export function evaluateMetadata(
 }
 
 /** Check name/symbol/URI/scam fields. */
-function checkMetadataFields(meta: { name: string; symbol: string; uri: string }): boolean {
+export function checkMetadataFields(meta: { name: string; symbol: string; uri: string }): boolean {
   const nameOk = meta.name.length >= DEFAULT_MIN_NAME_LENGTH && meta.name.length <= DEFAULT_MAX_NAME_LENGTH;
   const symbolOk = meta.symbol.length >= DEFAULT_MIN_SYMBOL_LENGTH && meta.symbol.length <= DEFAULT_MAX_SYMBOL_LENGTH;
   const uriOk = meta.uri.length > 0;

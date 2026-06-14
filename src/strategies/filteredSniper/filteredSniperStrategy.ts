@@ -78,6 +78,10 @@ export interface StrategyDataProvider {
   startAntiRugMonitoring(mint: string): void;
   /** Stop anti-rug monitoring for a mint and clear triggered flag. */
   stopAntiRugMonitoring(mint: string): void;
+  /** Start post-buy monitoring for a mint. */
+  startPostBuyMonitoring(mint: string, devWallet: string | null): void;
+  /** Stop post-buy monitoring for a mint. */
+  stopPostBuyMonitoring(mint: string): void;
   /** Transition a position to a new status in the registry. */
   transitionPosition(tradeId: string, to: string, reason: string): void;
 }
@@ -263,6 +267,7 @@ export class FilteredSniperStrategy implements IStrategy {
     this.sellFailureCounts.delete(tradeId);
     this.stuckPositionSkipCounts.delete(tradeId);
     this.dataProvider.stopAntiRugMonitoring(mint);
+    this.dataProvider.stopPostBuyMonitoring(mint);
     cleanupHighestPriceTracking(tradeId);
     void this.persistCompletedTiers();
     logger.info('Strategy cleanup after reconciled exit', { tradeId, mint });
@@ -433,7 +438,48 @@ export class FilteredSniperStrategy implements IStrategy {
     this.pendingMints.add(mint);
 
     try {
-      const checkData = await this.dataProvider.getEntryCheckData(signal);
+      // Safety-net timeout: getEntryCheckData has per-fetch timeouts inside
+      // (rpcFailover, pump.fun API, DB), but if a fetch races past its
+      // own AbortSignal or a new code path is added without a timeout, the
+      // outer await could hang indefinitely. That would leak the slot
+      // reservation (pendingBuyCount never decrements) and freeze all
+      // subsequent signals behind it in the queue. Cap total time at
+      // 20s — sum of worst-case path is 8s (mintAccount) + 6s (parallel
+      // fetches via Promise.allSettled) + 3-6s for sequential post-fetch
+      // awaits. 20s gives 1.5x headroom for a transient slow node.
+      const ENTRY_CHECK_TOTAL_TIMEOUT_MS = 20_000;
+      let checkData: Awaited<ReturnType<typeof this.dataProvider.getEntryCheckData>>;
+      try {
+        checkData = await Promise.race([
+          this.dataProvider.getEntryCheckData(signal),
+          new Promise<never>((_, reject) =>
+            setTimeout(
+              () => reject(new Error(`getEntryCheckData total timeout after ${ENTRY_CHECK_TOTAL_TIMEOUT_MS}ms`)),
+              ENTRY_CHECK_TOTAL_TIMEOUT_MS,
+            ),
+          ),
+        ]);
+      } catch (fetchErr: unknown) {
+        // Fetch-layer failure (timeout, RPC error, etc.) — log explicitly
+        // so a hung data provider is visible in logs, release the slot
+        // HERE (not via outer catch — we return cleanly without throwing
+        // to keep this an expected, handled failure rather than an
+        // unhandled exception in the caller), and skip this signal.
+        logger.error('Entry check fetch failed — releasing slot', {
+          mint,
+          error: fetchErr instanceof Error ? fetchErr.message : String(fetchErr),
+        });
+        this.pendingBuyCount -= 1;
+        this.buySlotClaimed = false;
+        this.pendingMints.delete(mint);
+        return {
+          allowed: false,
+          passedCount: 0,
+          failedCount: 1,
+          firstFailure: `entry check fetch failed: ${fetchErr instanceof Error ? fetchErr.message : String(fetchErr)}`,
+          checks: [],
+        };
+      }
 
       // Evaluate all 13 checks
       const decision = evaluateEntry(checkData);
@@ -494,6 +540,7 @@ export class FilteredSniperStrategy implements IStrategy {
         this.pendingMints.delete(mint);
         // Start anti-rug monitoring for this mint
         this.dataProvider.startAntiRugMonitoring(mint);
+        this.dataProvider.startPostBuyMonitoring(mint, null);
         logger.info('Buy executed, monitoring for exit', {
           mint,
           tradeId: buyResult.tradeId,
@@ -553,6 +600,8 @@ export class FilteredSniperStrategy implements IStrategy {
         this.activeMints.delete(mint);
         this.tradeIdToMint.delete(tradeId);
         this.dataProvider.stopAntiRugMonitoring(mint);
+        this.dataProvider.stopPostBuyMonitoring(mint);
+    this.dataProvider.stopPostBuyMonitoring(mint);
         logger.info('Position no longer exists — cleaned up mint', { tradeId, mint });
       } else {
         logger.info('Position no longer exists — removed from monitoring', { tradeId });
@@ -654,6 +703,7 @@ export class FilteredSniperStrategy implements IStrategy {
           this.tradeIdToMint.delete(tradeId);
           // Stop anti-rug monitoring and clear triggered flag
           this.dataProvider.stopAntiRugMonitoring(positionData.mint);
+          this.dataProvider.stopPostBuyMonitoring(positionData.mint);
           // Check if this position had tier 0 BEFORE deleting (needed for max positions reclaim)
           const hadTier0 = this.completedScaleOutTiers.get(tradeId)?.has(0) ?? false;
           this.completedScaleOutTiers.delete(tradeId);

@@ -31,6 +31,7 @@ import { WashTradeDetector } from './detectors/washTrade/washTradeDetector.js';
 import { DexPaidDetector } from './detectors/dexPaid/dexPaidDetector.js';
 import { RevokeAnalyzer } from './detectors/revoke/revokeAnalyzer.js';
 import { AntiRugMonitor } from './risk/controls/antiRug.js';
+import { PostBuyMonitor } from './risk/controls/postBuyMonitor.js';
 import { SmartMoneyDetector } from './detectors/smartMoney/smartMoneyDetector.js';
 import { CabalDetector } from './detectors/cabal/cabalDetector.js';
 import { ConcentrationAnalyzer } from './detectors/holderConcentration/concentrationAnalyzer.js';
@@ -187,7 +188,8 @@ async function main(): Promise<void> {
 
   // Create dataProvider now that detectors exist (needs bundle + wash + smartMoney data)
   const antiRugMonitor = new AntiRugMonitor(container.connection);
-  dataProvider = createDataProvider(container, positionRegistry, { bundleDetector, washTradeDetector, smartMoneyDetector, walletAgeDetector, buyVelocityAnalyzer, crossTokenCorrelator }, antiRugMonitor);
+  const postBuyMonitor = new PostBuyMonitor(container.connection);
+  dataProvider = createDataProvider(container, positionRegistry, { bundleDetector, washTradeDetector, smartMoneyDetector, walletAgeDetector, buyVelocityAnalyzer, crossTokenCorrelator }, antiRugMonitor, postBuyMonitor);
   strategy = new FilteredSniperStrategy(dataProvider, executionDelegate, undefined, undefined, container.riskStateRepository, container.maxExposureGuard);
   container.setStrategy(strategy);
 
@@ -233,6 +235,14 @@ async function main(): Promise<void> {
     if (s.creator) {
       walletAgeDetector.setCreator(s.mint, s.creator).catch(() => {});
     }
+
+    // Pre-warm bundle detector: initialize an empty token state from
+    // the actual launch timestamp so handleBuy can record buys against
+    // it even if the first WS buy event lags. Without this, a momentum
+    // signal firing within 30s of launch would hit forceAnalyze with
+    // a state that has < 1 buy and get "insufficient data" — same
+    // outcome as the window-still-open guard that this complements.
+    bundleDetector.handleLaunch(s.mint, s.timestamp);
 
     strategy.onSignal(signal).catch((err: unknown) => {
       logger.error('Launch signal processing failed', {
@@ -497,22 +507,30 @@ async function main(): Promise<void> {
 
   // Step 6: Connect WebSocket (using WsManager with auto-reconnect + URL rotation)
   logger.info('Connecting to Helius WebSocket...');
-  const wsUrl = container.wsUrl;
 
-  // Build fallback WS URLs from HELIUS_EXTRA_KEYS for 429 rotation
-  const wsFallbackUrls: string[] = [];
+  // Build the full WS URL pool from HELIUS_EXTRA_KEYS — every key is equal,
+  // no "primary" pinning. Helius free tier rate limits are per-API-key, so
+  // rotating across all extras is the only way to avoid 429s. WsManager
+  // iterates the pool on each reconnect / 429 / error.
+  const wsUrls: string[] = [];
   const extraKeys = process.env['HELIUS_EXTRA_KEYS'];
   if (extraKeys) {
     for (const key of extraKeys.split(',')) {
       const trimmed = key.trim();
       if (trimmed) {
-        wsFallbackUrls.push(`wss://mainnet.helius-rpc.com/?api-key=${trimmed}`);
+        wsUrls.push(`wss://mainnet.helius-rpc.com/?api-key=${trimmed}`);
       }
     }
   }
-  if (wsFallbackUrls.length > 0) {
-    logger.info('WS fallback URLs loaded', { count: wsFallbackUrls.length });
+  if (wsUrls.length === 0) {
+    throw new Error('HELIUS_EXTRA_KEYS missing — cannot start WS without at least one Helius API key');
   }
+
+  // First key = initial connection. All other keys = rotation pool.
+  const wsUrl = wsUrls[0]!;
+  const wsFallbackUrls = wsUrls.slice(1);
+
+  logger.info('WS pool loaded', { primary: 1, fallbacks: wsFallbackUrls.length });
 
   const wsManager = new WsManager({
     url: wsUrl,
