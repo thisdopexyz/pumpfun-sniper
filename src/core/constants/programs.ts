@@ -135,5 +135,9 @@ export const SYSTEM_RENT_PROGRAM_ID = new PublicKey(
  */
 export const BONKFUN_TOKEN_DECIMALS = 6 as const;
 
-/** Minimum pool state account data size for BonkFun (LaunchLab) tokens. */
-export const MIN_BONKFUN_POOL_STATE_SIZE = 375 as const;
+/**
+ * Minimum pool state account data size for BonkFun (LaunchLab) tokens.
+ * VERIFIED ON-CHAIN 2026-06-23: all queried BonkFun pool states are exactly
+ * 429 bytes. Keep in sync with POOL_STATE_MIN_LEN in bonkfun/shared.ts.
+ */
+export const MIN_BONKFUN_POOL_STATE_SIZE = 429 as const;

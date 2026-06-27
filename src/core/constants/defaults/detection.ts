@@ -91,10 +91,16 @@ export const DEFAULT_METADATA_STRUCTURAL_PATTERNS: readonly RegExp[] = [
  * Prevents buying tokens that are too fresh — first few seconds are chaotic
  * bot territory with no organic activity. Gives time for initial dust to settle.
  *
- * Rationale: 30s is enough for the first wave of organic buyers to show up,
- * while still catching tokens early in their lifecycle.
+ * Rationale: 30s is enough to filter out the instant bundle-burst pattern
+ * (dev launches with 20-50 bundled wallets all buying in <5s, which can
+ * briefly hit 15 buys + 10 SOL momentum). After 30s, either organic buyers
+ * show up (good — momentum is real) or the bundle spam dies down and the
+ * momentum signal stops firing (good — we don't enter).
+ *
+ * 30s does NOT block real organic pumps at the 5-15 min sweet spot where
+ * Check 21 (max_buy_mcap $25k) hasn't started rejecting yet.
  */
-export const DEFAULT_MIN_TOKEN_AGE_SECONDS = 1200 as const;
+export const DEFAULT_MIN_TOKEN_AGE_SECONDS = 30 as const;
 
 // ---------------------------------------------------------------------------
 // Market cap entry filter

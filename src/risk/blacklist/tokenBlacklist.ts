@@ -89,13 +89,6 @@ export class TokenBlacklist {
   }
 
   /**
-   * Blacklist a token after a failed heuristic check.
-   */
-  handleFailedCheck(mint: MintAddress, checkName: string): void {
-    this.add(mint, `Failed check: ${checkName}`);
-  }
-
-  /**
    * Get all blacklisted tokens.
    */
   getAll(): readonly TokenBlacklistEntry[] {

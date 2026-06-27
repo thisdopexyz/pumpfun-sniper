@@ -5,7 +5,7 @@
  * or max total exposure is reached.
  *
  * Dynamic behavior:
- *   - Base limit = DEFAULT_MAX_CONCURRENT_POSITIONS (2)
+ *   - Base limit = DEFAULT_MAX_CONCURRENT_POSITIONS (1)
  *   - After scale-out tier 0: +1 (capital partially recovered)
  *   - Hard cap: MAX_POSITIONS_CAP (5)
  *   - On full exit: -1 (down to base)

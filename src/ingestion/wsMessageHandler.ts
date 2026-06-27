@@ -72,10 +72,6 @@ export async function handleWsMessage(
     // ── Step 1: Check if this is a LaunchLab (BonkFun) transaction ──────
     const isLaunchLab = logs.some(l => l.includes(LAUNCHLAB_PROGRAM_ID_STR));
 
-    // TRACE: log after isLaunchLab check
-    if (source === 'launchlab') {
-    }
-
     // ── Step 0: If message from LaunchLab WS, ONLY process initialize ──
     // Non-initialize LaunchLab messages (buy/sell/trade) must not fall through to PumpFun decoder
     if (source === 'launchlab' && !isLaunchLab) {

@@ -45,9 +45,9 @@ interface MintMonitorState {
 export interface AntiRugConfig {
   /** Whether the monitor is enabled. Default: true. */
   readonly enabled?: boolean;
-  /** Emergency exit — single holder dump > this % of total supply. Default: 10. */
+  /** Emergency exit — single holder dump > this % of total supply. Default: 8. */
   readonly thresholdPct?: number;
-  /** Emergency exit — ALL top holders combined dump > this % of total supply. Default: 15. */
+  /** Emergency exit — ALL top holders combined dump > this % of total supply. Default: 12. */
   readonly cumulativeDumpThresholdPct?: number;
   /** Polling interval in ms. Default: 5000. */
   readonly checkIntervalMs?: number;
@@ -69,6 +69,9 @@ export class AntiRugMonitor {
 
   /** Active monitoring state per mint. */
   private readonly monitors = new Map<string, MintMonitorState>();
+
+  /** Mints with a poll currently in-flight. Prevents overlapping polls. */
+  private readonly polling = new Set<string>();
 
   constructor(connection: Connection, config?: AntiRugConfig) {
     this.connection = connection;
@@ -101,8 +104,22 @@ export class AntiRugMonitor {
     });
 
     // Take an initial snapshot before starting the interval
-    const intervalId = setInterval(async () => {
-      await this.pollMint(mint, onRugDetected);
+    const intervalId = setInterval(() => {
+      // Skip if previous poll still in flight — prevents overlapping polls
+      // when RPC latency exceeds POLL_INTERVAL_MS (which would cause stale
+      // snapshot writes and missed rug dumps).
+      if (this.polling.has(mint)) return;
+      this.polling.add(mint);
+      this.pollMint(mint, onRugDetected)
+        .catch((err: unknown) => {
+          logger.debug('Anti-rug poll threw', {
+            mint,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        })
+        .finally(() => {
+          this.polling.delete(mint);
+        });
     }, this.checkIntervalMs);
 
     // Store with empty snapshot — first poll will populate it
@@ -114,12 +131,19 @@ export class AntiRugMonitor {
     });
 
     // Fire the first poll immediately to establish baseline
-    void this.pollMint(mint, onRugDetected).catch((err: unknown) => {
-      logger.error('Initial anti-rug poll failed', {
-        mint,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    });
+    if (!this.polling.has(mint)) {
+      this.polling.add(mint);
+      void this.pollMint(mint, onRugDetected)
+        .catch((err: unknown) => {
+          logger.error('Initial anti-rug poll failed', {
+            mint,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        })
+        .finally(() => {
+          this.polling.delete(mint);
+        });
+    }
   }
 
   /**

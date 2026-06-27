@@ -50,9 +50,9 @@ describe('Sell pressure (Check 14) — ratio', () => {
     expect(c!.passed).toBe(true);
   });
 
-  it('All 25 checks present', () => {
+  it('All 27 checks present', () => {
     const data = makeBaseData();
     const result = evaluateEntry(data);
-    expect(result.checks.length).toBe(25);
+    expect(result.checks.length).toBe(27);
   });
 });

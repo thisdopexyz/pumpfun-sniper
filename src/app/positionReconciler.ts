@@ -34,6 +34,8 @@ export interface ReconcilerConfig {
 export class PositionReconciler {
   private readonly config: ReconcilerConfig;
   private intervalHandle: ReturnType<typeof setInterval> | null = null;
+  /** Prevents overlapping reconcile runs when RPC > RECONCILE_INTERVAL_MS. */
+  private reconcileInFlight = false;
 
   constructor(config: ReconcilerConfig) {
     this.config = config;
@@ -43,7 +45,13 @@ export class PositionReconciler {
     // Run once immediately, then periodically
     void this.reconcile();
     this.intervalHandle = setInterval(() => {
-      void this.reconcile();
+      // Skip if previous reconcile still in flight — prevents duplicate DB writes
+      // when RPC latency exceeds RECONCILE_INTERVAL_MS.
+      if (this.reconcileInFlight) return;
+      this.reconcileInFlight = true;
+      void this.reconcile().finally(() => {
+        this.reconcileInFlight = false;
+      });
     }, RECONCILE_INTERVAL_MS);
     logger.info('Position reconciler started', { intervalMs: RECONCILE_INTERVAL_MS });
   }

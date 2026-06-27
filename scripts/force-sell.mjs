@@ -97,7 +97,11 @@ async function main() {
     process.exit(1);
   }
 
-  const HELIUS_KEY = process.env.HELIUS_API_KEY;
+  // Use first Helius key from extra pool (or legacy HELIUS_API_KEY if set).
+  // Manual sells need a real RPC to fetch blockhash + bonding curve + send tx
+  // — public RPC will 429. This matches the bot's runtime key pool.
+  const HELIUS_KEY = process.env.HELIUS_API_KEY
+    ?? process.env.HELIUS_EXTRA_KEYS?.split(',')[0]?.trim();
   const RPC_URL = HELIUS_KEY
     ? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`
     : 'https://api.mainnet-beta.solana.com';

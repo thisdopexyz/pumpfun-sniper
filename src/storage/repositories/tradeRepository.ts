@@ -61,6 +61,39 @@ export class TradeRepository implements IRepository<TradeRecord, TradeId> {
     return toTradeRecord(row);
   }
 
+  /**
+   * MED-POSITION-1 fix: source-of-truth check for in-flight positions.
+   * Returns count of CONFIRMED BUY trades that have NO matching SELL row
+   * (i.e., position still open on-chain). DB is authoritative — in-memory
+   * `positionRegistry` is just a cache. If cache desyncs (e.g. after a
+   * restart, missed transition, or partial state), this query catches it
+   * and prevents the strategy from opening a 2nd concurrent position.
+   *
+   * Recent window (24h) — older unmatched BUYs are reconciled at startup
+   * by `positionRecovery`, so anything older is already closed.
+   */
+  async countOpenPositions(windowMs: number = 24 * 60 * 60 * 1000): Promise<number> {
+    const cutoffMs = Date.now() - windowMs;
+    const result = await query<{ count: string }>({
+      text: `
+        SELECT COUNT(*)::text AS count
+        FROM trades t1
+        WHERE t1.side = 'BUY'
+          AND t1.status = 'CONFIRMED'
+          AND to_timestamp(t1.submitted_at::double precision / 1000) > to_timestamp($1::double precision / 1000)
+          AND NOT EXISTS (
+            SELECT 1 FROM trades t2
+            WHERE t2.side = 'SELL'
+              AND t2.status = 'CONFIRMED'
+              AND (t2.id = 'sell-' || t1.id OR t2.id LIKE 'sell-' || t1.id || '-%')
+          )
+      `,
+      values: [cutoffMs],
+    });
+    const row = result.rows[0];
+    return row ? parseInt(row.count, 10) : 0;
+  }
+
   async save(record: TradeRecord): Promise<void> {
     await query({
       text: `INSERT INTO trades (

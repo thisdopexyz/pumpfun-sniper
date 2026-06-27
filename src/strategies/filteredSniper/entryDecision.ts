@@ -1,10 +1,11 @@
 /**
  * Entry Decision
  *
- * Evaluates ALL 25 entry checks from rule.md before allowing a buy.
- * Every single check must pass. No shortcuts. No partial passes.
+ * Evaluates ALL 27 entry checks from rule.md before allowing a buy.
+ * Every single check must pass (or fall within the soft-fail tolerance).
+ * No shortcuts. No partial passes.
  *
- * The 25 checks (from rule.md):
+ * The 27 checks (from rule.md + entryCheckData):
  *   1. Launch detected
  *   2. Creator not blacklisted
  *   3. Creator history acceptable
@@ -26,6 +27,12 @@
  *  19. Smart money presence (boost, never blocks)
  *  20. Minimum token age (avoid bot chaos zone)
  *  21. Maximum buy market cap (avoid already-pumped tokens)
+ *  22. Minimum average buy size (anti micro-buy spam)
+ *  23. Minimum holder count
+ *  24. Wallet age score (Dev Multi-Wallet Defense)
+ *  25. Buy velocity score (Dev Multi-Wallet Defense)
+ *  26. Enhanced bundle percentage (Dev Multi-Wallet Defense)
+ *  27. Cross-token correlation (Dev Multi-Wallet Defense)
  *
  * Strategy = business logic ONLY. No RPC, no DB, no protocol decoding.
  * All data is provided via the EntryCheckData interface.
@@ -49,6 +56,7 @@ import {
   MIN_HOLDER_FLOOR,
   MAX_VOLUME_MCAP_RATIO,
   MAX_BUY_MCAP_USD,
+  MIN_TOKEN_AGE_SECONDS,
   MIN_AVG_BUY_SIZE_LAMPORTS,
   MIN_HOLDER_COUNT,
   MAX_WALLET_AGE_SCORE,
@@ -77,7 +85,7 @@ const entryRejectionCounter = new Counter({
 // Types
 // ---------------------------------------------------------------------------
 
-/** Data required for all 25 entry checks. */
+/** Data required for all 27 entry checks. */
 export interface EntryCheckData {
   readonly mint: MintAddress;
 
@@ -126,7 +134,7 @@ export interface EntryCheckData {
   /** Check 11: Bundle percentage (0-100). Null if unknown. */
   readonly bundlePct?: number | null;
 
-  /** Check 12: Wash trade score (0-1, higher = more suspicious). Null if unknown. */
+  /** Check 12: Wash trade score (0-100, higher = more suspicious). Null if unknown. */
   readonly washTradeScore?: number | null;
 
   /** Check 13: Unique wallets in momentum window. */
@@ -175,9 +183,9 @@ interface CheckResult {
 
 /** Entry decision result. */
 export interface EntryDecisionResult {
-  /** Whether ALL 25 checks passed. */
+  /** Whether ALL 27 checks passed (within soft-fail tolerance). */
   readonly allowed: boolean;
-  /** Individual check results (always 25). */
+  /** Individual check results (always 27). */
   readonly checks: readonly CheckResult[];
   /** Number of checks that passed. */
   readonly passedCount: number;
@@ -206,7 +214,7 @@ export interface EntryDecisionResult {
 // ---------------------------------------------------------------------------
 
 /**
- * Evaluate all 25 entry checks. ALL must pass.
+ * Evaluate all 27 entry checks. ALL must pass (or fall within soft-fail tolerance).
  *
  * Returns immediately on first failure for speed, but still reports
  * all check results for logging/telemetry.
@@ -283,10 +291,12 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
         : 'High wallet concentration detected (whale risk)',
     },
     // Check 9: Momentum threshold met (buy count + volume + window)
-    // NOTE: Check 13 (unique_wallets min 20) is stricter than this check's
-    // min_buy_count (15). Momentum can fire with 15 buys, but if those buys
-    // come from < 20 unique wallets, Check 13 will block. This is intentional:
-    // momentum alone doesn't guarantee wallet diversity.
+    // NOTE: Check 13 (unique_wallets min 20) is a SOFT check (MED-AUDIT-1).
+    // Both Check 9 and Check 13 must pass for the entry to count as clean;
+    // either failure counts toward SOFT_FAIL_TOLERANCE=2, so an early-stage
+    // token with 15 buys from 5 unique wallets could still pass (e.g., if
+    // bundle/wash checks are unavailable). Real anti-scam gating is at
+    // Check 11/12/26 (bundle %).
     (() => {
       const buyCountOk = data.buyCountInWindow >= MOMENTUM_MIN_BUYS;
       const windowOk = data.windowMs <= MOMENTUM_WINDOW_MS;
@@ -323,7 +333,7 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
     // Check 12: Wash trade score acceptable (block if score > 60)
     (() => {
       if (data.washTradeScore == null) {
-        return { name: 'wash_trade_check', passed: false, reason: 'Wash trade data unavailable — BLOCKING (risk too high)' };
+        return { name: 'wash_trade_check', passed: false, reason: 'Wash trade data unavailable — soft-skipping' };
       }
       const passed = data.washTradeScore <= MAX_WASH_TRADE_SCORE;
       return {
@@ -331,14 +341,15 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
         passed,
         reason: passed
           ? `Wash trade OK: score ${data.washTradeScore.toFixed(0)}/100`
-          : `WASH TRADE SUSPECTED: score ${data.washTradeScore.toFixed(0)}/100 (max 60)`,
+          : `WASH TRADE SUSPECTED: score ${data.washTradeScore.toFixed(0)}/100 (max ${MAX_WASH_TRADE_SCORE})`,
       };
     })(),
-    // Check 11: Bundle percentage acceptable (60s window — single-multi-wallet scheme)
-    // BLOCK if data unavailable — anti-scam check requires data
+    // Check 11: Bundle percentage acceptable (180s window — multi-wallet scheme)
+    // BundleDetector default windowSeconds=180, but forceAnalyze returns data
+    // after 30s minimum (forceAnalyzeMinMs). MED-AUDIT-1: now soft.
     (() => {
       if (data.bundlePct == null) {
-        return { name: 'bundle_pct', passed: false, reason: 'Bundle % unavailable — BLOCKING (anti-scam check requires data)' };
+        return { name: 'bundle_pct', passed: false, reason: 'Bundle % unavailable — soft-skipping' };
       }
       const passed = data.bundlePct <= MAX_BUNDLE_PCT;
       return {
@@ -350,10 +361,10 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
       };
     })(),
     // Check 13: Unique wallets in momentum window (min 12)
-    // BLOCK if data unavailable — wallet diversity is critical for anti-manipulation
+    // MED-AUDIT-1: now soft — wallet diversity data is sometimes unavailable
     (() => {
       if (data.uniqueWallets == null) {
-        return { name: 'unique_wallets', passed: false, reason: 'Wallet count unavailable — BLOCKING (need diversity data)' };
+        return { name: 'unique_wallets', passed: false, reason: 'Wallet count unavailable — soft-skipping' };
       }
       const passed = data.uniqueWallets >= MIN_UNIQUE_WALLETS;
       return {
@@ -373,7 +384,7 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
         return { name: 'sell_pressure', passed: true, reason: 'Sell pressure tracking not yet active — skipping' };
       }
       if (data.sellCountInWindow == null || data.buyCountInWindow === 0) {
-        return { name: 'sell_pressure', passed: false, reason: 'Sell pressure data unavailable — BLOCKING' };
+        return { name: 'sell_pressure', passed: false, reason: 'Sell pressure data unavailable — SOFT-FAILING (data-quality, not anti-scam)' };
       }
       const totalTrades = data.buyCountInWindow + data.sellCountInWindow;
       const sellRatio = totalTrades > 0 ? (data.sellCountInWindow / totalTrades) * 100 : 0;
@@ -388,10 +399,10 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
     })(),
     // Check 15: Liquidity depth sufficient (real SOL reserves)
     // Minimum 0.5 SOL in bonding curve — prevents entering dead/low-liquidity tokens
-    // BLOCK if data unavailable — liquidity data should always be available from bonding curve
+    // MED-AUDIT-1: now soft — liquidity data may be unavailable for non-pump tokens
     (() => {
       if (data.realSolReservesLamports == null) {
-        return { name: 'liquidity_depth', passed: false, reason: 'Real SOL reserves unavailable — BLOCKING (need liquidity data)' };
+        return { name: 'liquidity_depth', passed: false, reason: 'Real SOL reserves unavailable — soft-skipping' };
       }
       const minReservesLamports = MIN_LIQUIDITY_DEPTH_LAMPORTS;
       const reservesSol = Number(data.realSolReservesLamports) / 1e9;
@@ -428,11 +439,14 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
     })(),
     // Check 17: Holder-MCap ratio (catches coordinated holder inflation)
     // Pattern: 300+ holders but mcap only $11k = mass coordinated buys, will dump
-    // Threshold: > 0.015 holders per dollar of mcap = suspicious
-    // DYNAMIC: Stricter for new tokens (< 5 min) — coordinated buys happen fast
-    // Examples: 300 holders / $11k = 0.027 → BLOCK
-    //           50 holders / $50k = 0.001 → PASS
-    //           200 holders / $500k = 0.0004 → PASS
+    // Tiers (holders per dollar of mcap, stricter as mcap grows):
+    //   mcap < $2k   -> 0.012
+    //   mcap < $5k   -> 0.009
+    //   mcap < $10k  -> 0.006
+    //   mcap >= $10k -> 0.005
+    // Examples: 300 holders / $11k = 0.027 -> BLOCK
+    //           50 holders / $50k  = 0.001 -> PASS
+    //           200 holders / $500k = 0.0004 -> PASS
     (() => {
       if (data.holderCount == null || data.marketCapUsd == null || data.marketCapUsd <= 0) {
         return { name: 'holder_mcap_ratio', passed: true, reason: 'Holder/MCap data unavailable — skipping' };
@@ -444,9 +458,9 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
       // Mcap-based tiers (looser for lower mcap, tighter for higher)
       const mcap = data.marketCapUsd;
       const ratio = data.holderCount / mcap;
-      const maxRatio = mcap < 2000 ? 0.02 :
-                       mcap < 5000 ? 0.015 :
-                       mcap < 10000 ? 0.01 : 0.008;
+      const maxRatio = mcap < 2000 ? 0.012 :
+                       mcap < 5000 ? 0.009 :
+                       mcap < 10000 ? 0.006 : 0.005;
       const passed = ratio <= maxRatio;
       return {
         name: 'holder_mcap_ratio',
@@ -492,12 +506,29 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
       };
     })(),
 
+    // Check 20: Minimum token age (avoid bot chaos zone)
+    // SOFT — data may be unavailable early in token lifecycle (race with launch detector).
+    // SOFT pass when null: launch just happened, can't compute age reliably yet.
+    (() => {
+      if (data.secondsSinceLaunch === undefined || data.secondsSinceLaunch === null) {
+        return { name: 'min_token_age', passed: true, reason: 'Token age unavailable — skipping (too early)' };
+      }
+      const passed = data.secondsSinceLaunch >= MIN_TOKEN_AGE_SECONDS;
+      return {
+        name: 'min_token_age',
+        passed,
+        reason: passed
+          ? `Token age OK: ${data.secondsSinceLaunch}s (min ${MIN_TOKEN_AGE_SECONDS}s)`
+          : `TOKEN TOO FRESH: ${data.secondsSinceLaunch}s (min ${MIN_TOKEN_AGE_SECONDS}s) — bot chaos zone, wait for organic buyers`,
+      };
+    })(),
+
     // Check 21: Maximum buy market cap (avoid already-pumped tokens)
     // BLOCK if mcap exceeds threshold — diminishing returns for small positions
-    // BLOCK if data unavailable — can't assess risk without mcap data
+    // MED-AUDIT-1: now soft — mcap data may be unavailable for non-pump tokens
     (() => {
       if (data.marketCapUsd == null || data.marketCapUsd <= 0) {
-        return { name: 'max_buy_mcap', passed: false, reason: 'Market cap unavailable — BLOCKING (data unavailable, risk too high)' };
+        return { name: 'max_buy_mcap', passed: false, reason: 'Market cap unavailable — soft-skipping' };
       }
       const passed = data.marketCapUsd <= MAX_BUY_MCAP_USD;
       return {
@@ -514,7 +545,7 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
     // BLOCK if data unavailable — parsing must be correct to get on-chain data
     (() => {
       if (data.volumeLamports == null || data.buyCountInWindow == null || data.buyCountInWindow === 0) {
-        return { name: 'min_avg_buy_size', passed: false, reason: 'Avg buy size unavailable — BLOCKING (parsing failed, no on-chain data)' };
+        return { name: 'min_avg_buy_size', passed: false, reason: 'Avg buy size unavailable — SOFT-FAILING (data-quality, parsing may need warming)' };
       }
       const avgBuySize = data.volumeLamports / BigInt(data.buyCountInWindow);
       const passed = avgBuySize >= MIN_AVG_BUY_SIZE_LAMPORTS;
@@ -532,7 +563,7 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
     // BLOCK if data unavailable — parsing must be correct to get on-chain data
     (() => {
       if (data.holderCount == null) {
-        return { name: 'min_holder_count', passed: false, reason: 'Holder count unavailable — BLOCKING (parsing failed, no on-chain data)' };
+        return { name: 'min_holder_count', passed: false, reason: 'Holder count unavailable — SOFT-FAILING (Helius API may be slow/down)' };
       }
       const passed = data.holderCount >= MIN_HOLDER_COUNT;
       return {
@@ -546,10 +577,10 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
 
     // Check 24: Wallet Age Score (Dev Multi-Wallet Defense)
     // BLOCK if majority of buying wallets are brand new (< 1 hour old)
-    // BLOCK if data unavailable — critical anti-scam check
+    // MED-AUDIT-1: now soft — detector may not have data for all mints
     (() => {
       if (data.walletAgeScore == null) {
-        return { name: 'wallet_age_score', passed: false, reason: 'Wallet age score unavailable — BLOCKING (anti-scam check requires data)' };
+        return { name: 'wallet_age_score', passed: false, reason: 'Wallet age score unavailable — soft-skipping' };
       }
       const passed = data.walletAgeScore <= MAX_WALLET_AGE_SCORE;
       return {
@@ -563,10 +594,10 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
 
     // Check 25: Buy Velocity Score (Dev Multi-Wallet Defense)
     // BLOCK if buy velocity indicates bot swarm or coordinated mass-buy
-    // BLOCK if data unavailable — critical anti-scam check
+    // MED-AUDIT-1: now soft — detector may not have data
     (() => {
       if (data.buyVelocityScore == null) {
-        return { name: 'buy_velocity_score', passed: false, reason: 'Buy velocity score unavailable — BLOCKING (anti-scam check requires data)' };
+        return { name: 'buy_velocity_score', passed: false, reason: 'Buy velocity score unavailable — soft-skipping' };
       }
       const passed = data.buyVelocityScore <= MAX_BUY_VELOCITY_SCORE;
       return {
@@ -581,10 +612,10 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
     // Check 26: Enhanced Bundle Percentage (Dev Multi-Wallet Defense)
     // BLOCK if enhanced bundle % exceeds threshold (lowered from original 40%)
     // Uses 180s window instead of 60s, catches slower multi-wallet schemes
-    // BLOCK if data unavailable — critical anti-scam check
+    // MED-AUDIT-1: now soft — detector may not have data
     (() => {
       if (data.enhancedBundlePct == null) {
-        return { name: 'enhanced_bundle_pct', passed: false, reason: 'Enhanced bundle % unavailable — BLOCKING (anti-scam check requires data)' };
+        return { name: 'enhanced_bundle_pct', passed: false, reason: 'Enhanced bundle % unavailable — soft-skipping' };
       }
       const passed = data.enhancedBundlePct <= MAX_ENHANCED_BUNDLE_PCT;
       return {
@@ -598,10 +629,10 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
 
     // Check 27: Cross-Token Correlation (Dev Multi-Wallet Defense)
     // BLOCK if wallets from previous dump-tokens are buying this token
-    // BLOCK if data unavailable — critical anti-scam check
+    // MED-AUDIT-1: now soft — detector may not have data
     (() => {
       if (data.crossTokenScore == null) {
-        return { name: 'cross_token_score', passed: false, reason: 'Cross-token score unavailable — BLOCKING (anti-scam check requires data)' };
+        return { name: 'cross_token_score', passed: false, reason: 'Cross-token score unavailable — soft-skipping' };
       }
       const passed = data.crossTokenScore <= MAX_CROSS_TOKEN_SCORE;
       return {
@@ -627,7 +658,7 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
   // threshold. "Hard" checks are non-negotiable anti-scam gates.
   //
   // A token is ALLOWED if it has zero hard failures AND <= SOFT_FAIL_TOLERANCE
-  // soft failures. This lets the bot snipe tokens that are 24-25/26 in
+  // soft failures. This lets the bot snipe tokens that are 25-26/27 in
   // practice (data race / strict count off by one) while still blocking
   // real scams (bundle, dev multi-wallet, blacklist, rug risk).
   //
@@ -642,18 +673,39 @@ export function evaluateEntry(data: EntryCheckData): EntryDecisionResult {
   //     - mint/freeze authority — not all tokens revoke (pump.fun pattern)
   //     - data-quality checks (holder count, unique wallets, mcap, etc.)
   //     - analytics boosters (smart money, cross-token, etc.)
+  // MED-AUDIT-1 fix (2026-06-20): relaxed hard-fail set.
+  // The old set marked `metadata_sane`, `bundle_pct`, `wash_trade_check`,
+  // `enhanced_bundle_pct` as HARD. This caused most tokens to be blocked
+  // with "X unavailable — BLOCKING" because the off-chain detectors either
+  // hadn't warmed up (data unavailable) or the bonding-curve metadata
+  // wasn't parseable (Token-2022 mints, no MPL metadata).
+  //
+  // New policy: a check is HARD only when the data is GUARANTEED available
+  // (onchain RPC, launch event) and failure means a real anti-pattern.
+  // Anti-scam signals whose data is sometimes unavailable (bundle, wash,
+  // enhanced_bundle) are now SOFT — they skip when data is null instead
+  // of blocking. Real scams with detectable bundles still trigger the
+  // hard reject via the 3-soft-fail tolerance.
+  //
+  //   HARD = structural, data always available, failure = real anti-pattern:
+  //     - launch_detected: no launch = nothing to buy
+  //     - creator_not_blacklisted: KNOWN scammer (DB)
+  //     - liquidity_sane: bonding curve must exist
+  //     - momentum_threshold_met: must have momentum
+  //   SOFT = heuristic / data-quality / sometimes unavailable:
+  //     - everything else, including the anti-scam detectors
   const HARD_FAIL_NAMES = new Set([
     'launch_detected',
     'creator_not_blacklisted',
-    'metadata_sane',
     'liquidity_sane',
     'momentum_threshold_met',
-    'wash_trade_check',
-    'bundle_pct',
-    'enhanced_bundle_pct',
   ]);
 
-  const SOFT_FAIL_TOLERANCE = 3; // allow up to 3 soft fails when all hard pass
+  // MED-AUDIT-1: tighter tolerance now that anti-scam checks are soft.
+  // With 23 soft checks, allowing 2 fails means 25/27 = 93% pass rate.
+  // Lowering to 2 requires 25/27 = 93% — still lenient, but catches more
+  // borderline tokens where 3 different data sources are missing.
+  const SOFT_FAIL_TOLERANCE = 2;
 
   const passedCount = checks.filter((c) => c.passed).length;
   const failedCount = checks.length - passedCount;

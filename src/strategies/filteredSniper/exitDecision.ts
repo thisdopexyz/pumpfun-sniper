@@ -215,7 +215,7 @@ export function evaluateExit(data: PositionData): ExitDecisionResult {
       } else if (highestPnlPercent >= 200) {
         dynamicTrailingPct = 25; // At 200%+, trail by 25%
       } else {
-        dynamicTrailingPct = TRAILING_STOP_PCT; // Default (30%)
+        dynamicTrailingPct = TRAILING_STOP_PCT; // Default (55%)
       }
       // Trailing stop price = highest * (100 - trailingPct) / 100
       const trailingStopPrice = (data.highestPriceLamports * BigInt(100 - dynamicTrailingPct)) / 100n;
@@ -276,18 +276,12 @@ export function evaluateExit(data: PositionData): ExitDecisionResult {
   }
 
   if (data.devSellTriggered) {
-    logger.warn('Exit decision: DEV_SELL triggered', {
+    // DEV_SELL check disabled — see postBuyMonitor.ts comments (2026-06-23).
+    // Kept as no-op for backward compat with PositionData interface; never fires.
+    logger.debug('Exit decision: devSellTriggered is a no-op (feature disabled)', {
       tradeId: data.tradeId,
       mint: data.mint,
-      pnlPercent: pnlPercent.toFixed(2),
     });
-    return {
-      shouldExit: true,
-      reason: 'ANTI_RUG',
-      pnlPercent,
-      elapsedMs,
-      explanation: 'Post-buy: dev wallet selling — exit immediately',
-    };
   }
 
   if (data.holderDropTriggered) {

@@ -37,8 +37,8 @@ Supports classic SPL and Token-2022 mints. Entry via Pump.fun or BonkFun bonding
 ├──────────────────────────────────────────────────────────────┤
 │                     DETECTORS LAYER                           │
 │   Launch • Momentum • Bundle • Wash Trade • Migration         │
-│   DexPaid • Revoke • Smart Money • Cabal                      │
-│   Holder Concentration • Day Phase                            │
+│   Smart Money • Holder Concentration                           │
+│   (Dev Multi-Wallet: WalletAge • BuyVelocity • CrossToken)    │
 ├──────────────────────────────────────────────────────────────┤
 │                     ADAPTERS LAYER                            │
 │   PumpFun Protocol (SDK, trade builder, event decoder)        │
@@ -199,12 +199,7 @@ Every token must pass **ALL** 23 checks before a buy is executed:
 | BundleDetector | Cluster wallet detection | Yes (blocks if ≥ 40%) |
 | WashTradeDetector | Artificial volume detection | Yes (blocks if score > 60) |
 | MigrationDetector | Bonding curve graduation | No (analytics) |
-| DexPaidDetector | DexScreener paid listing | No (analytics) |
-| RevokeAnalyzer | Authority revoke detection | No (analytics) |
 | SmartMoneyDetector | Known profitable wallets | Boost only |
-| CabalDetector | Coordinated wallet groups | No (analytics) |
-| ConcentrationAnalyzer | Top holder % analysis | No (analytics) |
-| DayPhaseDetector | Market session detection | No (analytics) |
 
 ## Tech Stack
 
@@ -312,12 +307,10 @@ src/
     bundle/bundleDetector.ts           — Cluster wallet detection
     washTrade/washTradeDetector.ts     — Artificial volume detection
     lifecycle/migrationDetector.ts     — Bonding curve graduation
-    dexPaid/dexPaidDetector.ts         — DexScreener paid listing
-    revoke/revokeAnalyzer.ts           — Authority revoke detection
     smartMoney/smartMoneyDetector.ts   — Known profitable wallets
-    cabal/cabalDetector.ts             — Coordinated wallet groups
-    holderConcentration/concentrationAnalyzer.ts
-    dayPhase/dayPhaseDetector.ts       — Market session detection
+    walletAge/walletAgeDetector.ts     — Brand-new wallet detection
+    buyVelocity/buyVelocityAnalyzer.ts — Bot swarm / coordinated buys
+    crossToken/crossTokenCorrelator.ts — Serial scammer wallet tracking
 
   risk/
     controls/

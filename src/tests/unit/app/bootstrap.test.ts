@@ -11,7 +11,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const mockRequireEnv = vi.fn((name: string) => {
   if (name === 'WALLET_SECRET_KEY') return Buffer.alloc(64, 7).toString('base64');
   if (name === 'HELIUS_API_KEY') return 'helius-key';
-  if (name === 'DATABASE_URL') return 'postgresql://pumpfun:pumpfun123@localhost:5432/pumpfun';
+  if (name === 'HELIUS_EXTRA_KEYS') return 'extra-key-1,extra-key-2';
+  if (name === 'DATABASE_URL') return 'postgresql://pumpfun:***@localhost:5432/pumpfun';
   if (name === 'REDIS_URL') return 'redis://localhost:6379';
   throw new Error(`missing ${name}`);
 });
@@ -70,9 +71,31 @@ vi.mock('../../../app/container.js', () => ({
 }));
 
 describe('bootstrap postgres startup', () => {
+  let savedEnv: Record<string, string | undefined>;
+
   beforeEach(() => {
     vi.clearAllMocks();
     mockPostgresHealthCheck.mockImplementation(async () => ({ ok: true, latencyMs: 1 }));
+    // bootstrap.ts reads process.env directly (not via requireEnv) for some vars
+    savedEnv = {
+      HELIUS_EXTRA_KEYS: process.env['HELIUS_EXTRA_KEYS'],
+      HELIUS_API_KEY: process.env['HELIUS_API_KEY'],
+      WALLET_SECRET_KEY: process.env['WALLET_SECRET_KEY'],
+      DATABASE_URL: process.env['DATABASE_URL'],
+      REDIS_URL: process.env['REDIS_URL'],
+    };
+    process.env['HELIUS_EXTRA_KEYS'] = 'extra-key-1,extra-key-2';
+    process.env['HELIUS_API_KEY'] = 'helius-key';
+    process.env['WALLET_SECRET_KEY'] = Buffer.alloc(64, 7).toString('base64');
+    process.env['DATABASE_URL'] = 'postgresql://pumpfun:***@localhost:5432/pumpfun';
+    process.env['REDIS_URL'] = 'redis://localhost:6379';
+  });
+
+  afterEach(() => {
+    for (const [key, val] of Object.entries(savedEnv)) {
+      if (val === undefined) delete process.env[key];
+      else process.env[key] = val;
+    }
   });
 
   it('eagerly creates and health-checks Postgres before startup completes', async () => {

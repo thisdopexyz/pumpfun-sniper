@@ -80,8 +80,14 @@ export function startSolFloorMonitor(config: SolFloorMonitorConfig): () => void 
   const { container, positionRegistry, executeSell } = config;
   const connection = container.connection;
   const sellingMints = new Set<string>(); // prevent duplicate sells
+  let tickInFlight = false; // prevents overlapping ticks if RPC > POLL_INTERVAL_MS
 
-  const interval = setInterval(async () => {
+  const interval = setInterval(() => {
+    // Skip if previous tick still in flight — prevents wasted RPC + duplicate
+    // force-sell attempts when RPC latency exceeds POLL_INTERVAL_MS.
+    if (tickInFlight) return;
+    tickInFlight = true;
+    (async () => {
     try {
       const activePositions = positionRegistry.getActive();
       if (activePositions.length === 0) return;
@@ -139,6 +145,9 @@ export function startSolFloorMonitor(config: SolFloorMonitorConfig): () => void 
         error: err instanceof Error ? err.message : String(err),
       });
     }
+    })().finally(() => {
+      tickInFlight = false;
+    });
   }, POLL_INTERVAL_MS);
 
   logger.info('SOL floor monitor started', {

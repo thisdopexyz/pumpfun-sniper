@@ -107,7 +107,7 @@ export const DEFAULT_EXIT_MONITOR_POLL_MS = 1_000 as const;
 /** Default compute budget for Pump.fun buy/sell (generous). */
 export const DEFAULT_PUMPFUN_COMPUTE_BUDGET: ComputeBudgetParams = {
   computeUnitLimit: 200_000,
-  computeUnitPrice: 350_000n, // ~$0.01 priority fee at $150 SOL
+  computeUnitPrice: 700_000n, // 2x dari 350k, fee ~$0.02/tx
 } as const;
 
 /** Default compute budget for Jupiter swap (higher CU needed). */

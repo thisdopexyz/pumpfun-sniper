@@ -2,7 +2,7 @@
  * Filtered Sniper Strategy
  *
  * The main strategy class that orchestrates:
- *   1. Entry evaluation (all 13 checks)
+ *   1. Entry evaluation (all 27 checks, soft-fail tolerance: 2)
  *   2. Position monitoring
  *   3. Exit evaluation (TP/SL/timeout)
  *
@@ -74,12 +74,18 @@ export interface StrategyDataProvider {
   getActivePositionCount(): number;
   /** Check if a token is blacklisted (e.g., after stop-loss exit). */
   isTokenBlacklisted(mint: string): boolean;
+  /**
+   * DB-backed source-of-truth check for in-flight positions.
+   * Returns true if DB has any unmatched (open) BUY trade.
+   * Used as defense in depth against in-memory state desync.
+   */
+  hasOpenPositionInDb(): Promise<boolean>;
   /** Start anti-rug monitoring for a mint (no-op if disabled). */
   startAntiRugMonitoring(mint: string): void;
   /** Stop anti-rug monitoring for a mint and clear triggered flag. */
   stopAntiRugMonitoring(mint: string): void;
-  /** Start post-buy monitoring for a mint. */
-  startPostBuyMonitoring(mint: string, devWallet: string | null): void;
+  /** Start post-buy monitoring for a mint (volume drop + holder drop detection). */
+  startPostBuyMonitoring(mint: string): void;
   /** Stop post-buy monitoring for a mint. */
   stopPostBuyMonitoring(mint: string): void;
   /** Transition a position to a new status in the registry. */
@@ -169,9 +175,16 @@ export class FilteredSniperStrategy implements IStrategy {
   private readonly sellFailureCounts = new Map<string, number>();
   /** Track stuck positions — skip N cycles before retrying sell. */
   private readonly stuckPositionSkipCounts = new Map<string, number>();
-  private static readonly MAX_SELL_FAILURES = 5;
+  /** Track timestamp (ms) of last sell attempt per trade. Enforce cooldown to avoid spam on 429. */
+  private readonly lastSellAttemptAt = new Map<string, number>();
+  /** Min ms between sell attempts for same trade. Prevents rapid-fire 429 spam. */
+  private static readonly SELL_RETRY_COOLDOWN_MS = 30_000;
+  /** After this many fails, exponential backoff up to SELL_RETRY_COOLDOWN_MAX_MS. */
+  private static readonly MAX_SELL_FAILURES = 3;
   /** After MAX_SELL_FAILURES, wait this many cycles before retrying (exponential backoff). */
   private static readonly STUCK_POSITION_BACKOFF_MULTIPLIER = 3;
+  /** Hard cap on consecutive sell failures before marking trade STUCK (manual intervention). */
+  private static readonly STUCK_TRADE_FAIL_THRESHOLD = 10;
 
   /**
    * Signal queue for when all position slots are full.
@@ -368,9 +381,9 @@ export class FilteredSniperStrategy implements IStrategy {
    *   1. Check if strategy is running
    *   2. Check if we have capacity (max concurrent positions)
    *   3. Fetch entry check data from provider
-   *   4. Evaluate all 9 entry checks
-   *   5. If ALL pass → execute buy
-   *   6. If ANY fail → reject (log reason)
+   *   4. Evaluate all 27 entry checks
+   *   5. If allowed (within soft-fail tolerance) → execute buy
+   *   6. If rejected → log reason
    */
   async onSignal(signal: Signal): Promise<EntryDecisionResult | null> {
     const mint = signal.mint;
@@ -390,6 +403,24 @@ export class FilteredSniperStrategy implements IStrategy {
         mint,
         signalType: signal.type,
       });
+      return null;
+    }
+
+    // Guard (DEFENSE IN DEPTH): DB-backed open-position check.
+    // The in-memory `positionRegistry` is a cache; if it desyncs (e.g. after
+    // an ungraceful restart, missed transition, or partial state update),
+    // `getActivePositionCount()` can under-report. DB is authoritative.
+    // If DB shows an open position, block regardless of in-memory state.
+    if (await this.dataProvider.hasOpenPositionInDb()) {
+      logger.warn('Signal blocked by DB open-position check (defense in depth)', {
+        mint,
+        inMemoryActive: this.dataProvider.getActivePositionCount(),
+      });
+      // Queue for after the open position closes — same as capacity check below
+      if (!this.signalQueue.has(mint) && this.signalQueue.size < FilteredSniperStrategy.SIGNAL_QUEUE_MAX_SIZE) {
+        this.signalQueue.set(mint, { signal, queuedAt: nowMs() });
+        logger.info('Signal queued (DB has open position)', { mint });
+      }
       return null;
     }
 
@@ -481,7 +512,7 @@ export class FilteredSniperStrategy implements IStrategy {
         };
       }
 
-      // Evaluate all 13 checks
+      // Evaluate all 27 checks
       const decision = evaluateEntry(checkData);
 
       if (!decision.allowed) {
@@ -497,7 +528,7 @@ export class FilteredSniperStrategy implements IStrategy {
         return decision;
       }
 
-      // ALL 21 CHECKS PASSED — execute buy
+      // ALL CHECKS PASSED — execute buy
       // Calculate dynamic position size if sizer available
       let positionSizeUsd: number = POSITION_SIZE_USD;
       if (this.positionSizer !== null) {
@@ -517,7 +548,7 @@ export class FilteredSniperStrategy implements IStrategy {
         });
       }
 
-      logger.info('ALL 21 entry checks passed — executing buy', {
+      logger.info('ALL entry checks passed — executing buy', {
         mint,
         passedCount: decision.passedCount,
         positionSizeUsd,
@@ -540,7 +571,7 @@ export class FilteredSniperStrategy implements IStrategy {
         this.pendingMints.delete(mint);
         // Start anti-rug monitoring for this mint
         this.dataProvider.startAntiRugMonitoring(mint);
-        this.dataProvider.startPostBuyMonitoring(mint, null);
+        this.dataProvider.startPostBuyMonitoring(mint);
         logger.info('Buy executed, monitoring for exit', {
           mint,
           tradeId: buyResult.tradeId,
@@ -627,21 +658,59 @@ export class FilteredSniperStrategy implements IStrategy {
         elapsedMs: exitDecision.elapsedMs,
       });
 
+      // Cooldown: skip if we just attempted sell for this trade within cooldown window.
+      // Prevents 429 spam — bot would otherwise retry every 1s and get rate-limited.
+      const lastAttempt = this.lastSellAttemptAt.get(tradeId);
+      const now = nowMs();
+      if (lastAttempt !== undefined && now - lastAttempt < FilteredSniperStrategy.SELL_RETRY_COOLDOWN_MS) {
+        const waitSec = Math.ceil((FilteredSniperStrategy.SELL_RETRY_COOLDOWN_MS - (now - lastAttempt)) / 1000);
+        logger.debug('Sell cooldown active — skipping this cycle', {
+          tradeId,
+          mint: positionData.mint,
+          waitSec,
+          reason: exitDecision.reason,
+        });
+        this.monitoredTrades.add(tradeId);
+        return;
+      }
+
       // Remove from monitoring BEFORE executing to prevent double-exit.
       // Also mark in-flight because setInterval callbacks may overlap when an
       // earlier sell is still waiting for chain confirmation.
       this.monitoredTrades.delete(tradeId);
       this.exitingTrades.add(tradeId);
+      this.lastSellAttemptAt.set(tradeId, now);
 
       let sellResult;
       try {
-        sellResult = await this.executionDelegate.executeSell({
+        // Hard timeout: if executeSell hangs (e.g. RPC connection dead, no response),
+        // reject after 60s so the strategy's failure counter increments and the
+        // cooldown/backoff kicks in. Without this, a hung RPC could leave a
+        // position "stuck" forever with no log entry.
+        const SELL_HARD_TIMEOUT_MS = 60_000;
+        const sellPromise = this.executionDelegate.executeSell({
           tradeId,
           mint: positionData.mint,
           reason: exitDecision.reason,
           slippageBps: SLIPPAGE_BPS,
           sellPct: exitDecision.sellPct,
         });
+        let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+        const timeoutPromise = new Promise<never>((_, reject) => {
+          timeoutHandle = setTimeout(() => {
+            reject(new Error(`SELL TIMEOUT after ${SELL_HARD_TIMEOUT_MS}ms`));
+          }, SELL_HARD_TIMEOUT_MS);
+        });
+        sellResult = await Promise.race([sellPromise, timeoutPromise]);
+        if (timeoutHandle !== null) clearTimeout(timeoutHandle);
+      } catch (sellErr: unknown) {
+        const msg = sellErr instanceof Error ? sellErr.message : String(sellErr);
+        logger.error('SELL execution threw exception or timed out', {
+          tradeId,
+          mint: positionData.mint,
+          error: msg,
+        });
+        sellResult = { success: false, signature: null, error: msg };
       } finally {
         this.exitingTrades.delete(tradeId);
       }
@@ -656,6 +725,7 @@ export class FilteredSniperStrategy implements IStrategy {
             completed.add(tierIndex);
             this.completedScaleOutTiers.set(tradeId, completed);
             this.sellFailureCounts.delete(tradeId); // Reset failures — fresh start for next tier
+            this.lastSellAttemptAt.delete(tradeId); // Reset cooldown on success
             await this.persistCompletedTiers(); // MUST await — crash safety for tier recovery
 
             // After tier 0 (+100% sell 50%): unlock +1 concurrent position
@@ -673,8 +743,8 @@ export class FilteredSniperStrategy implements IStrategy {
           const tiersNeeded = SCALE_OUT_TIERS.length;
           if (completed && completed.size >= tiersNeeded) {
             // All scale-out tiers done — but DON'T mark as full exit yet!
-            // 40% of position still rides with trailing stop / SL / TP.
-            // (50% sold at tier 0, 10% at tier 1, remaining 40%)
+            // 30% of position still rides with trailing stop / SL / TP.
+            // (50% sold at tier 0, 20% at tier 1, remaining 30%)
             // Keep monitoring so trailing stop can lock remaining profits.
             this.dataProvider.transitionPosition(tradeId, 'SCALE_OUT_PARTIAL', 'SCALE_OUT_ALL_TIERS');
             this.monitoredTrades.add(tradeId);
@@ -730,12 +800,41 @@ export class FilteredSniperStrategy implements IStrategy {
         const failCount = (this.sellFailureCounts.get(tradeId) ?? 0) + 1;
         this.sellFailureCounts.set(tradeId, failCount);
 
+        // HARD CAP: if a single trade has failed to sell 10 times consecutively,
+        // mark it STUCK and stop trying. User must intervene manually.
+        // Without this, a chain of 429s + bad RPCs would loop forever.
+        if (failCount >= FilteredSniperStrategy.STUCK_TRADE_FAIL_THRESHOLD) {
+          this.stuckPositionSkipCounts.delete(tradeId);
+          this.completedScaleOutTiers.delete(tradeId);
+          this.sellFailureCounts.delete(tradeId);
+          this.lastSellAttemptAt.delete(tradeId);
+          try {
+            this.dataProvider.transitionPosition(tradeId, 'STUCK', 'SELL_STUCK_MANUAL_REQUIRED');
+          } catch {
+            // transition may be invalid for current state — log but don't crash
+          }
+          this.activeMints.delete(positionData.mint);
+          this.tradeIdToMint.delete(tradeId);
+          this.dataProvider.stopAntiRugMonitoring(positionData.mint);
+          this.dataProvider.stopPostBuyMonitoring(positionData.mint);
+          logger.error('SELL STUCK — manual intervention required, bot giving up on this trade', {
+            tradeId,
+            mint: positionData.mint,
+            consecutiveFailures: failCount,
+            lastError: sellResult.error,
+            action: 'MANUAL_SELL_REQUIRED',
+          });
+          return;
+        }
+
         if (failCount >= FilteredSniperStrategy.MAX_SELL_FAILURES) {
           // Don't give up! Keep position in monitoring with exponential backoff.
           // Token is still in wallet — must keep trying to sell.
+          // Backoff is in MONITOR POLLS (1s each). Combined with SELL_RETRY_COOLDOWN_MS
+          // (30s), the effective rate-limit on retry is ~30s.
           const backoffCycles = Math.min(
             failCount * FilteredSniperStrategy.STUCK_POSITION_BACKOFF_MULTIPLIER,
-            30, // max 30 cycles backoff
+            60, // max 60 cycles (~60s) backoff
           );
           this.stuckPositionSkipCounts.set(tradeId, backoffCycles);
           this.monitoredTrades.add(tradeId);
@@ -747,7 +846,9 @@ export class FilteredSniperStrategy implements IStrategy {
             lastError: sellResult.error,
           });
         } else {
-          logger.error('Exit execution failed — re-adding to monitor', {
+          // Cooldown (30s) is the primary rate-limit guard for fails 1-2.
+          // Re-add to monitor and let cooldown block rapid re-fire.
+          logger.error('Exit execution failed — re-adding to monitor (cooldown will gate retry)', {
             tradeId,
             error: sellResult.error,
             consecutiveFailures: failCount,

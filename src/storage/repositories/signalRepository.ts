@@ -10,12 +10,8 @@ import type {
   LiquidityPhaseSignal,
   WashTradeSignal,
   BundleSignal,
-  CabalSignal,
-  DayPhaseSignal,
-  DexPaidSignal,
   ConcentrationSignal,
   SmartMoneySignal,
-  RevokeSignal,
 } from '../../core/types/signal.js';
 import type { WalletAddress } from '../../core/types/wallet.js';
 
@@ -57,18 +53,10 @@ function reconstructSignal(row: SignalRow): Signal {
       return { ...base, ...data } as WashTradeSignal;
     case 'BUNDLE':
       return { ...base, ...data } as BundleSignal;
-    case 'CABAL':
-      return { ...base, ...data } as CabalSignal;
-    case 'DAY_PHASE':
-      return { ...base, ...data } as DayPhaseSignal;
-    case 'DEX_PAID':
-      return { ...base, ...data } as DexPaidSignal;
     case 'CONCENTRATION':
       return { ...base, ...data } as ConcentrationSignal;
     case 'SMART_MONEY':
       return { ...base, ...data } as SmartMoneySignal;
-    case 'REVOKE':
-      return { ...base, ...data } as RevokeSignal;
     case 'WALLET_AGE':
       return { ...base, ...data } as import('../../core/types/signal.js').WalletAgeSignal;
     case 'BUY_VELOCITY':
@@ -76,8 +64,16 @@ function reconstructSignal(row: SignalRow): Signal {
     case 'CROSS_TOKEN':
       return { ...base, ...data } as import('../../core/types/signal.js').CrossTokenSignal;
     default: {
-      const _exhaustive: never = base.type;
-      throw new Error(`Unknown signal type: ${_exhaustive as string}`);
+      // Unknown type (legacy DB row from before type cleanup, or future type
+      // not yet supported by this codebase). Filter out instead of throwing —
+      // otherwise findByMint() in dataProvider crashes and breaks entry flow.
+      console.warn('signalRepository: skipping unknown signal type', {
+        type: base.type,
+        id: base.id,
+        mint: base.mint,
+      });
+      // Return null via signalData path — caller must filter.
+      return null as unknown as Signal;
     }
   }
 }

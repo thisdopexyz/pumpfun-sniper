@@ -127,8 +127,15 @@ class RecordingProvider implements StrategyDataProvider {
     return false;
   }
 
+  async hasOpenPositionInDb(): Promise<boolean> {
+    return false;
+  }
+
   startAntiRugMonitoring(_mint: string): void {}
   stopAntiRugMonitoring(_mint: string): void {}
+  startPostBuyMonitoring(_mint: string): void {}
+  stopPostBuyMonitoring(_mint: string): void {}
+  transitionPosition(_tradeId: string, _to: string, _reason: string): void {}
 }
 
 class RecordingExecutor implements StrategyExecutionDelegate {
@@ -197,22 +204,47 @@ function makeMockContainer(overrides?: {
   const signals = overrides?.signals ?? [];
   const creatorLaunches = overrides?.creatorLaunches ?? signals.filter((signal): signal is LaunchSignal => signal.type === 'LAUNCH');
   const blacklistedCreators = new Set(overrides?.blacklistedCreators ?? []);
+  const execute = vi.fn(async (fn: (client: any) => Promise<any>) => {
+    return fn({
+      getAccountInfo: vi.fn().mockResolvedValue(null),
+      getTokenLargestAccounts: vi.fn().mockResolvedValue({ value: [] }),
+      getTokenSupply: vi.fn().mockResolvedValue({ value: { amount: '0' } }),
+    });
+  });
   return {
     connection: {
       getAccountInfo: vi.fn().mockResolvedValue(null),
       getTokenLargestAccounts: vi.fn().mockResolvedValue({ value: [] }),
       getTokenSupply: vi.fn().mockResolvedValue({ value: { amount: '0' } }),
     },
+    rpcFailover: {
+      execute,
+    },
+    solPriceOracle: {
+      getSolPriceUsd: vi.fn().mockResolvedValue(150),
+    },
     signalRepository: {
       findByMint: vi.fn().mockResolvedValue(signals),
       findRecentLaunchesByCreator: vi.fn().mockResolvedValue(creatorLaunches),
     },
+    creatorStatsRepository: {
+      getScore: vi.fn().mockResolvedValue(null),
+    },
+    riskStateRepository: {
+      loadState: vi.fn().mockResolvedValue(null),
+      saveState: vi.fn().mockResolvedValue(undefined),
+    },
+    maxExposureGuard: null,
     creatorBlacklist: {
       isBlacklisted: vi.fn((wallet: string) => blacklistedCreators.has(wallet)),
+    },
+    tokenBlacklist: {
+      isBlacklisted: vi.fn(() => false),
     },
     killSwitch: {
       isAlive: vi.fn(() => true),
     },
+    heliusApiKey: null,
   };
 }
 

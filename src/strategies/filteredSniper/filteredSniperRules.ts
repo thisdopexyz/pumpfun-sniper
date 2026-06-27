@@ -43,7 +43,7 @@ import {
 // ---------------------------------------------------------------------------
 
 /**
- * ALL 16 entry checks from rule.md. No shortcuts.
+ * ALL 27 entry checks from rule.md + entryCheckData. No shortcuts.
  *
  *   1. launch detected
  *   2. creator not blacklisted
@@ -55,8 +55,25 @@ import {
  *   8. wallet concentration acceptable
  *   9. momentum threshold met
  *  10. price impact acceptable
+ *  11. bundle percentage acceptable
+ *  12. wash trade score acceptable
+ *  13. unique wallets sufficient
+ *  14. sell pressure acceptable
+ *  15. liquidity depth sufficient
+ *  16. holder-to-bundle ratio acceptable
+ *  17. holder-MCap ratio acceptable
+ *  18. volume-MCap ratio acceptable
+ *  19. smart money presence (boost only)
+ *  20. minimum token age (avoid bot chaos zone)
+ *  21. maximum buy market cap (avoid already-pumped tokens)
+ *  22. minimum average buy size
+ *  23. minimum holder count
+ *  24. wallet age score
+ *  25. buy velocity score
+ *  26. enhanced bundle percentage
+ *  27. cross-token correlation
  */
-export const ENTRY_CHECK_COUNT = 26;
+export const ENTRY_CHECK_COUNT = 27;
 
 /** Price impact rule: max price impact in basis points. LOCKED. */
 export const MAX_PRICE_IMPACT_BPS = DEFAULT_MAX_PRICE_IMPACT_BPS;
@@ -115,7 +132,7 @@ export const TRAILING_STOP_PCT = DEFAULT_TRAILING_STOP_PCT;
 export const TRAILING_ACTIVATION_PCT = DEFAULT_TRAILING_ACTIVATION_PCT;
 
 /** Position timeout in seconds. LOCKED. */
-export const TIMEOUT_SECONDS = DEFAULT_TIMEOUT_SECONDS; // 60 minutes
+export const TIMEOUT_SECONDS = DEFAULT_TIMEOUT_SECONDS; // 6 hours (21600s)
 
 /** Position timeout in milliseconds. */
 export const TIMEOUT_MS = TIMEOUT_SECONDS * 1000;

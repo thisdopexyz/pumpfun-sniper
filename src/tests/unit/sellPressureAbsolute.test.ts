@@ -109,8 +109,8 @@ describe('Sell pressure — ratio (60% threshold, 30s buy / 60s sell)', () => {
     expect(c!.passed).toBe(false);
   });
 
-  it('All 25 checks present', () => {
+  it('All 27 checks present', () => {
     const r = evaluateEntry(makeData());
-    expect(r.checks.length).toBe(25);
+    expect(r.checks.length).toBe(27);
   });
 });

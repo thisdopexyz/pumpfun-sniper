@@ -10,6 +10,7 @@ import { AccountLayout } from '@solana/spl-token';
 import type { ServiceContainer } from './container.js';
 import type { StrategyExecutionDelegate } from '../strategies/filteredSniper/filteredSniperStrategy.js';
 import type { PositionRegistry } from '../core/state/positionRegistry.js';
+import type { CrossTokenCorrelator } from '../detectors/crossToken/crossTokenCorrelator.js';
 import { deriveUserATA } from '../adapters/protocols/pumpfun/pumpfunTradeBuilder.js';
 import { POSITION_SIZE_USD } from '../strategies/filteredSniper/filteredSniperRules.js';
 import { PumpSdk } from '../adapters/protocols/pumpfun/officialPumpSdk.js';
@@ -61,6 +62,7 @@ const RETRY_DELAY_MS = DEFAULT_TX_RETRY_DELAY_MS;
 export function createExecutionDelegate(
   container: ServiceContainer,
   positionRegistry: PositionRegistry,
+  crossTokenCorrelator?: CrossTokenCorrelator,
 ): StrategyExecutionDelegate {
   let tradeCounter = 0;
 
@@ -113,6 +115,7 @@ export function createExecutionDelegate(
     container,
     positionRegistry,
     pumpSdk,
+    crossTokenCorrelator,
     maxTxRetries: MAX_TX_RETRIES,
     retryDelayMs: RETRY_DELAY_MS,
     nextTradeId: () => {

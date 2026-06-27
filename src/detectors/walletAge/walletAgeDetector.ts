@@ -268,9 +268,6 @@ export class WalletAgeDetector implements IDetector {
     }
 
     state.wallets.set(wallet, { wallet, firstSeenAt: nowMs() });
-
-    // Store age — null means RPC failed, exclude from scoring
-    if (age === null) return; // Don't add wallet with unknown age
     state.ages.set(wallet, age);
   }
 

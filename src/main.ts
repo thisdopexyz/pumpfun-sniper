@@ -28,19 +28,13 @@ import { MomentumDetector } from './detectors/momentum/momentumDetector.js';
 import { MigrationSignalDetector } from './detectors/lifecycle/migrationDetector.js';
 import { BundleDetector } from './detectors/bundle/bundleDetector.js';
 import { WashTradeDetector } from './detectors/washTrade/washTradeDetector.js';
-import { DexPaidDetector } from './detectors/dexPaid/dexPaidDetector.js';
-import { RevokeAnalyzer } from './detectors/revoke/revokeAnalyzer.js';
 import { AntiRugMonitor } from './risk/controls/antiRug.js';
 import { PostBuyMonitor } from './risk/controls/postBuyMonitor.js';
 import { SmartMoneyDetector } from './detectors/smartMoney/smartMoneyDetector.js';
-import { CabalDetector } from './detectors/cabal/cabalDetector.js';
-import { ConcentrationAnalyzer } from './detectors/holderConcentration/concentrationAnalyzer.js';
-import { DayPhaseDetector } from './detectors/dayPhase/dayPhaseDetector.js';
 import { WalletAgeDetector } from './detectors/walletAge/walletAgeDetector.js';
 import { BuyVelocityAnalyzer } from './detectors/buyVelocity/buyVelocityAnalyzer.js';
 import { CrossTokenCorrelator } from './detectors/crossToken/crossTokenCorrelator.js';
 import { buildRpcPoolFromEnv } from './infra/rpcPool.js';
-import { CandleAnalyzer } from './strategies/filteredSniper/candleAnalyzer.js';
 import { CompoundManager } from './strategies/filteredSniper/compoundManager.js';
 import { EventDispatcher } from './ingestion/pipeline/eventDispatcher.js';
 import { EventNormalizer } from './ingestion/pipeline/eventNormalizer.js';
@@ -82,7 +76,8 @@ async function main(): Promise<void> {
   // Step 2: Wire strategy with data + execution providers
   logger.info('Wiring strategy...');
   const positionRegistry = new PositionRegistry();
-  const executionDelegate = createExecutionDelegate(container, positionRegistry);
+  // NOTE: executionDelegate is created AFTER crossTokenCorrelator instantiation
+  // (line ~176) so it can receive the correlator for sell-time dump tracking.
   // dataProvider + strategy created AFTER detectors (needs bundle/wash data)
   let dataProvider!: ReturnType<typeof createDataProvider>;
   let strategy!: FilteredSniperStrategy;
@@ -169,14 +164,7 @@ async function main(): Promise<void> {
   });
 
   // New analytics-only detectors (Phase 3.3–5.3) — declared early for dataProvider
-  const dexPaidDetector = new DexPaidDetector();
-  const rpcClient = container.rpcPool.getBest()!;
-  const revokeAnalyzer = new RevokeAnalyzer(rpcClient);
   const smartMoneyDetector = new SmartMoneyDetector();
-  const cabalDetector = new CabalDetector();
-  const concentrationAnalyzer = new ConcentrationAnalyzer();
-  const dayPhaseDetector = new DayPhaseDetector();
-  const candleAnalyzer = new CandleAnalyzer();
   const compoundManager = new CompoundManager();
 
   // Dev Multi-Wallet Defense detectors (Phase 6)
@@ -186,6 +174,11 @@ async function main(): Promise<void> {
   const buyVelocityAnalyzer = new BuyVelocityAnalyzer();
   const crossTokenCorrelator = new CrossTokenCorrelator();
 
+  // Create executionDelegate AFTER crossTokenCorrelator so sell-time dump
+  // tracking (pnlRecorder → markDump) is wired. Previously a monkey-patch
+  // on strategy.monitorTrade tried to do this but its check was dead code.
+  const executionDelegate = createExecutionDelegate(container, positionRegistry, crossTokenCorrelator);
+
   // Create dataProvider now that detectors exist (needs bundle + wash + smartMoney data)
   const antiRugMonitor = new AntiRugMonitor(container.connection);
   const postBuyMonitor = new PostBuyMonitor(container.connection);
@@ -193,19 +186,13 @@ async function main(): Promise<void> {
   strategy = new FilteredSniperStrategy(dataProvider, executionDelegate, undefined, undefined, container.riskStateRepository, container.maxExposureGuard);
   container.setStrategy(strategy);
 
-  // Cross-token dump detection: when strategy exits, mark token as dump
-  // This captures wallets that bought the same dumped token
-  const originalMonitorTrade = strategy.monitorTrade.bind(strategy);
-  (strategy as any).monitorTrade = (tradeId: string, mint?: string) => {
-    const result = originalMonitorTrade(tradeId, mint);
-    // After trade monitoring, check if position was exited
-    const pos = positionRegistry.get(tradeId);
-    if (pos && pos.status === 'EXITED' && mint) {
-      crossTokenCorrelator.markDump(mint);
-      logger.info('CrossToken: marked token as dump after exit', { mint: mint.slice(0, 12) });
-    }
-    return result;
-  };
+  // Cross-token dump detection: now wired via pnlRecorder.recordPnlAndRisk()
+  // which is called on every actual sell execution. Previously there was a
+  // monkey-patch on strategy.monitorTrade that checked `pos.status === 'EXITED'`
+  // after monitorTrade() returned — but monitorTrade() never changes status
+  // to EXITED (that's done by sellExecutor after sell confirms). So the
+  // dump tracking via that path NEVER fired (dead code). The new path in
+  // pnlRecorder is the real hook.
 
   // Load persisted scale-out tiers from DB
   await strategy.loadCompletedTiers();
@@ -250,16 +237,6 @@ async function main(): Promise<void> {
         error: err instanceof Error ? err.message : String(err),
       });
     });
-
-    // Analytics: check dex paid timing after launch detection
-    void dexPaidDetector.checkDexPaid(s.mint, s.timestamp ?? nowMs()).then((result) => {
-      logger.info('DexPaid check after launch', {
-        mint: s.mint,
-        isPaid: result.isPaid,
-        isLate: result.isLate,
-        gapMinutes: result.gapMinutes.toFixed(1),
-      });
-    }).catch(() => {});
   });
 
   momentumDetector.onSignal((signal) => {
@@ -309,33 +286,8 @@ async function main(): Promise<void> {
   });
 
   // Wire new analytics-only detectors — save signals to DB, don't trigger buys
-  dexPaidDetector.onSignal((signal) => {
-    logger.info('DexPaid signal detected', { mint: signal.mint });
-    void container.signalRepository.save(signal).catch(() => {});
-  });
-
-  revokeAnalyzer.onSignal((signal) => {
-    logger.info('Revoke signal detected', { mint: signal.mint });
-    void container.signalRepository.save(signal).catch(() => {});
-  });
-
   smartMoneyDetector.onSignal((signal) => {
     logger.info('SmartMoney signal detected', { mint: signal.mint });
-    void container.signalRepository.save(signal).catch(() => {});
-  });
-
-  cabalDetector.onSignal((signal) => {
-    logger.info('Cabal signal detected', { mint: signal.mint });
-    void container.signalRepository.save(signal).catch(() => {});
-  });
-
-  concentrationAnalyzer.onSignal((signal) => {
-    logger.info('Concentration signal detected', { mint: signal.mint });
-    void container.signalRepository.save(signal).catch(() => {});
-  });
-
-  dayPhaseDetector.onSignal((signal) => {
-    logger.info('DayPhase signal detected', { mint: signal.mint });
     void container.signalRepository.save(signal).catch(() => {});
   });
 
@@ -391,11 +343,6 @@ async function main(): Promise<void> {
       smartMoneyDetector.recordTrade(mint, wallet, isBuy, timestamp);
     }
 
-    // Feed buy events to cabal detector
-    if (isBuy && wallet) {
-      cabalDetector.recordTrade(mint, wallet, timestamp);
-    }
-
     // Feed buy events to Dev Multi-Wallet Defense detectors
     if (isBuy && wallet) {
       walletAgeDetector.recordBuy(mint, wallet).catch((err: unknown) => {
@@ -412,13 +359,6 @@ async function main(): Promise<void> {
     if (!isBuy && wallet) {
       crossTokenCorrelator.recordBuy(mint, wallet, timestamp);
     }
-
-    // Record candle data for exit analysis (approximate OHLC from individual trades)
-    const priceApprox = Number(solAmount) / 1e9;
-    candleAnalyzer.recordCandle(mint, {
-      open: priceApprox, high: priceApprox, low: priceApprox, close: priceApprox,
-      volume: priceApprox, timestamp,
-    });
   });
 
   dispatcher.on('migration', (event) => {
@@ -428,7 +368,7 @@ async function main(): Promise<void> {
     });
   });
 
-  logger.info('Detection pipeline ready (launch + momentum + migration + bundle + washTrade + dexPaid + revoke + smartMoney + cabal + concentration + dayPhase + candleAnalyzer + compoundManager + WALLET_AGE + BUY_VELOCITY + CROSS_TOKEN)');
+  logger.info('Detection pipeline ready (launch + momentum + migration + bundle + washTrade + smartMoney + compoundManager + WALLET_AGE + BUY_VELOCITY + CROSS_TOKEN)');
   const cs = compoundManager.getCompoundStats();
   logger.info('Compound manager ready', { coldWalletPct: cs.coldWalletPct, tradingWalletPct: cs.tradingWalletPct });
   await launchDetector.start();
@@ -436,12 +376,7 @@ async function main(): Promise<void> {
   await migrationDetector.start();
   await bundleDetector.start();
   await washTradeDetector.start();
-  await dexPaidDetector.start();
-  await revokeAnalyzer.start();
   await smartMoneyDetector.start();
-  await cabalDetector.start();
-  await concentrationAnalyzer.start();
-  await dayPhaseDetector.start();
   await walletAgeDetector.start();
   await buyVelocityAnalyzer.start();
   await crossTokenCorrelator.start();

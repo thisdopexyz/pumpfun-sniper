@@ -8,7 +8,7 @@ import type { MintAddress } from './token.js';
 import type { WalletAddress } from './wallet.js';
 
 /** Signal type discriminator */
-export type SignalType = 'LAUNCH' | 'MOMENTUM' | 'MIGRATION' | 'LIQUIDITY_PHASE' | 'WASH_TRADE' | 'BUNDLE' | 'CABAL' | 'DAY_PHASE' | 'DEX_PAID' | 'CONCENTRATION' | 'SMART_MONEY' | 'REVOKE' | 'WALLET_AGE' | 'BUY_VELOCITY' | 'CROSS_TOKEN';
+export type SignalType = 'LAUNCH' | 'MOMENTUM' | 'MIGRATION' | 'LIQUIDITY_PHASE' | 'WASH_TRADE' | 'BUNDLE' | 'CONCENTRATION' | 'SMART_MONEY' | 'WALLET_AGE' | 'BUY_VELOCITY' | 'CROSS_TOKEN';
 
 /** Unique signal identifier */
 export type SignalId = string;
@@ -75,32 +75,6 @@ export interface BundleSignal extends BaseSignal {
   readonly windowMs: number;
 }
 
-/** Cabal / coordinated wallet cluster detected */
-export interface CabalSignal extends BaseSignal {
-  readonly type: 'CABAL';
-  readonly cabalScore: number;
-  readonly clusterSize: number;
-  readonly wallets: readonly WalletAddress[];
-}
-
-/** Day phase analysis result */
-export interface DayPhaseSignal extends BaseSignal {
-  readonly type: 'DAY_PHASE';
-  readonly fdv: number;
-  readonly athDipPct: number;
-  readonly sidewaysDays: number;
-  readonly holderTrend: 'growing' | 'stable' | 'declining';
-}
-
-/** DEX paid listing detected (late entry signal) */
-export interface DexPaidSignal extends BaseSignal {
-  readonly type: 'DEX_PAID';
-  readonly isPaid: boolean;
-  readonly isLate: boolean;
-  readonly gapMinutes: number;
-  readonly paidTimestamp: number | null;
-}
-
 /** Holder concentration warning */
 export interface ConcentrationSignal extends BaseSignal {
   readonly type: 'CONCENTRATION';
@@ -115,15 +89,6 @@ export interface SmartMoneySignal extends BaseSignal {
   readonly smartWalletCount: number;
   readonly smartMoneyScore: number;
   readonly wallets: readonly string[];
-}
-
-/** Token authority revoke timing analysis */
-export interface RevokeSignal extends BaseSignal {
-  readonly type: 'REVOKE';
-  readonly revoked: boolean;
-  readonly revokeTimestamp: number | null;
-  readonly revokedAfterDump: boolean;
-  readonly isPositive: boolean;
 }
 
 /** Wallet age analysis — detects tokens bought primarily by brand-new wallets */
@@ -167,4 +132,4 @@ export interface LaunchEvent {
 }
 
 /** Union of all signal types */
-export type Signal = LaunchSignal | MomentumSignal | MigrationSignal | LiquidityPhaseSignal | WashTradeSignal | BundleSignal | CabalSignal | DayPhaseSignal | DexPaidSignal | ConcentrationSignal | SmartMoneySignal | RevokeSignal | WalletAgeSignal | BuyVelocitySignal | CrossTokenSignal;
+export type Signal = LaunchSignal | MomentumSignal | MigrationSignal | LiquidityPhaseSignal | WashTradeSignal | BundleSignal | ConcentrationSignal | SmartMoneySignal | WalletAgeSignal | BuyVelocitySignal | CrossTokenSignal;

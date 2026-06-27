@@ -32,6 +32,7 @@ import {
 import { computePositionSizeLamports } from './executionDelegate.js';
 import { getRealHolderCount } from './heliusHolderCount.js';
 import { getRealVolume1h } from './realVolumeFetcher.js';
+import { TradeRepository } from '../storage/repositories/tradeRepository.js';
 import {
   evaluateAuthority,
   evaluateLiquidity,
@@ -274,6 +275,8 @@ export function createDataProvider(
   postBuyMonitor?: PostBuyMonitor,
 ): StrategyDataProvider {
   const conn = container.connection;
+  // TradeRepository for DB-backed open-position check (defense in depth)
+  const tradeRepository = new TradeRepository();
 
   // In-memory caches (per session)
   const metadataCache = new Map<string, { name: string; symbol: string; uri: string } | null>();
@@ -309,9 +312,9 @@ export function createDataProvider(
       antiRugTriggeredMints.delete(mint);
     },
 
-    startPostBuyMonitoring(mint: string, devWallet: string | null): void {
+    startPostBuyMonitoring(mint: string): void {
       if (!postBuyMonitor) return;
-      postBuyMonitor.startMonitoring(mint, devWallet, (detectedMint: string, reason: string, details: string) => {
+      postBuyMonitor.startMonitoring(mint, (detectedMint: string, reason: string, details: string) => {
         postBuyTriggeredMints.set(detectedMint, reason);
         logger.warn('Post-buy exit triggered', { mint: detectedMint.slice(0, 12), reason, details });
       });
@@ -418,7 +421,11 @@ export function createDataProvider(
         })(), 6_000, 'fetch.poolState'),
       ]);
 
-      const signalsForMint = results[5].status === 'fulfilled' ? results[5].value : [];
+      // Filter nulls (unknown signal types from legacy DB rows or future types
+      // not yet supported — signalRepository.reconstructSignal returns null
+      // for unknown types instead of throwing).
+      const signalsForMint = (results[5].status === 'fulfilled' ? results[5].value : [])
+        .filter((s): s is Signal => s !== null);
       if (results[5].status === 'rejected') {
         logger.warn('Failed to load signal history for entry checks', {
           mint: mint.slice(0, 12),
@@ -435,14 +442,16 @@ export function createDataProvider(
       const poolStateAccount = results[6].status === 'fulfilled' ? results[6].value : null;
       const { liquiditySane, bondingCurveCreator } = evaluateLiquidity(bondingCurveAccount, poolStateAccount);
 
-      const creatorAddress = (latestLaunch?.creator ?? bondingCurveCreator) as WalletAddress | null;
+      let creatorAddress = (latestLaunch?.creator ?? bondingCurveCreator) as WalletAddress | null;
       let launchDetected = evaluateLaunchProvenance(launchSignals, liquiditySane, creatorAddress);
 
       // Race-condition fallback: launch signal not yet persisted to DB when
       // momentum signal fires (signalRepository.findByMint is async). Confirm
       // the mint exists on PumpFun via the frontend API and treat it as a
-      // valid launch. Same endpoint used for created_timestamp fallback below.
-      if (!launchDetected) {
+      // valid launch. Also update creatorAddress so Check 2 (HARD
+      // creator_not_blacklisted) doesn't fail purely due to creator-not-yet-DB.
+      // Same endpoint used for created_timestamp fallback below.
+      if (!launchDetected || creatorAddress === null) {
         try {
           const pfRes = await withTimeout(
             fetch(
@@ -456,7 +465,10 @@ export function createDataProvider(
             const pfData = await pfRes.json() as { mint?: string; creator?: string };
             if (pfData.mint === mint) {
               launchDetected = true;
-              logger.debug('Launch detected via PumpFun API race-condition fallback', {
+              if (creatorAddress === null && typeof pfData.creator === 'string') {
+                creatorAddress = pfData.creator as WalletAddress;
+              }
+              logger.debug('Launch/creator resolved via PumpFun API fallback', {
                 mint: mint.slice(0, 12),
                 creator: pfData.creator?.slice(0, 12),
               });
@@ -618,7 +630,9 @@ export function createDataProvider(
           });
         }
       } else if (parsedPool && parsedPool.virtualQuote > 0n) {
-        // BonkFun price impact: use virtualQuote (SOL reserves)
+        // BonkFun price impact: use virtualQuote (10-lamport units → lamports via *10)
+        // virtualQuote stores values 10x smaller than lamports (1 unit = 10 lamports).
+        // Multiplying by 10 brings it to lamport units to match positionSizeLamports.
         try {
           const solPriceUsd = await withTimeout(
             getSolPriceWithFallback(container.solPriceOracle),
@@ -626,7 +640,8 @@ export function createDataProvider(
             'fetch.solPrice.impact.bonk',
           );
           const positionSizeLamports = computePositionSizeLamports(solPriceUsd);
-          priceImpactBps = Number(positionSizeLamports * 10000n) / Number(parsedPool.virtualQuote + positionSizeLamports);
+          const bonkLiquidityLamports = parsedPool.virtualQuote * 10n;
+          priceImpactBps = Number(positionSizeLamports * 10000n) / Number(bonkLiquidityLamports + positionSizeLamports);
         } catch (err: unknown) {
           logger.warn('Failed to compute BonkFun price impact — SOL price unavailable', {
             mint: mint.slice(0, 12),
@@ -706,7 +721,14 @@ export function createDataProvider(
           // pricePerTokenScaled is in (lamports * 10^6) / raw_token units.
           // marketCapLamports = priceScaled * supply → in (lamports * 10^6) units.
           // To get SOL: /10^6 (undo scaling) / 10^9 (lamports→SOL) = /10^15
-          marketCapUsd = Number(marketCapLamports / 10n ** 15n) * solPriceUsd;
+          //
+          // SAFETY: BigInt division truncates to 0 for tiny tokens (<$1k mcap).
+          // We use `marketCapLamports > 0n ? max(...) : 0` to preserve a $1
+          // floor for any non-zero mcap, so Check 20 (max_buy_mcap $25k) still
+          // has correct magnitude data even for fresh launches.
+          const mcapRaw = Number(marketCapLamports / 10n ** 15n);
+          const mcapInSol = marketCapLamports > 0n ? Math.max(mcapRaw, 0.001) : 0;
+          marketCapUsd = mcapInSol * solPriceUsd;
         } catch (err: unknown) {
           logger.warn('Failed to calculate market cap', {
             mint: mint.slice(0, 12),
@@ -1033,7 +1055,7 @@ export function createDataProvider(
         highestPriceLamports,
         antiRugTriggered: antiRugTriggeredMints.has(pos.mint),
         volumeDropTriggered: postBuyTriggeredMints.get(pos.mint) === 'VOLUME_DROP',
-        devSellTriggered: postBuyTriggeredMints.get(pos.mint) === 'DEV_SELL',
+        devSellTriggered: false, // DEV_SELL check removed 2026-06-23 — see postBuyMonitor.ts
         holderDropTriggered: postBuyTriggeredMints.get(pos.mint) === 'HOLDER_DROP',
       };
     },
@@ -1044,6 +1066,25 @@ export function createDataProvider(
 
     isTokenBlacklisted(mint: string): boolean {
       return container.tokenBlacklist.isBlacklisted(mint);
+    },
+
+    /**
+     * DB-backed source of truth for open positions.
+     * Use as a defense-in-depth check to prevent concurrent-position
+     * violations when the in-memory `positionRegistry` is out of sync.
+     */
+    async hasOpenPositionInDb(): Promise<boolean> {
+      try {
+        const count = await tradeRepository.countOpenPositions();
+        return count > 0;
+      } catch (err) {
+        // Fail open: if DB query fails, fall back to in-memory check.
+        // We do NOT want a DB outage to block all trading.
+        logger.warn('hasOpenPositionInDb query failed, falling back to in-memory check', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return false;
+      }
     },
   };
 }

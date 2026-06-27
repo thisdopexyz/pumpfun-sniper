@@ -31,8 +31,8 @@ const POLL_INTERVAL_MS = 2_000;
 /** Volume drop threshold: 80% */
 const VOLUME_DROP_THRESHOLD_PCT = 90;
 
-/** Holder count drop threshold: 30% */
-const HOLDER_DROP_THRESHOLD_PCT = 50;
+/** Holder drop threshold: 30% of top-20 must churn out within 5s windows. */
+const HOLDER_DROP_THRESHOLD_PCT = 30;
 
 /** Volume check: compare last 10s vs previous 10s */
 const VOLUME_WINDOW_MS = 10_000;
@@ -53,7 +53,6 @@ export type PostBuyExitCallback = (mint: string, reason: string, details: string
 /** Per-mint monitoring state. */
 interface MintMonitorState {
   readonly mint: string;
-  readonly devWallet: string | null;
   readonly startedAt: number;
 
   // Volume tracking
@@ -66,9 +65,6 @@ interface MintMonitorState {
   lastHolderCount: number;
   lastHolderCheckAt: number;
 
-  // Dev wallet tracking
-  devLastBalance: bigint | null;
-
   // Polling
   intervalId: ReturnType<typeof setInterval>;
 }
@@ -80,6 +76,8 @@ interface MintMonitorState {
 export class PostBuyMonitor {
   private readonly connection: Connection;
   private readonly monitors = new Map<string, MintMonitorState>();
+  /** In-flight poll guard. Prevents overlapping polls when RPC > POLL_INTERVAL_MS. */
+  private readonly polling = new Set<string>();
 
   constructor(connection: Connection) {
     this.connection = connection;
@@ -87,10 +85,14 @@ export class PostBuyMonitor {
 
   /**
    * Start monitoring a mint after buy.
+   *
+   * Note: `devWallet` parameter was removed (2026-06-23) — caller always
+   * passed null and the implementation was broken (see class comments).
+   * If dev tracking is needed later, add a `devAta: PublicKey | null`
+   * param and use `getAccountInfo(devAta)` for specific balance reads.
    */
   startMonitoring(
     mint: string,
-    devWallet: string | null,
     onExitSignal: PostBuyExitCallback,
   ): void {
     if (this.monitors.has(mint)) {
@@ -98,18 +100,27 @@ export class PostBuyMonitor {
       return;
     }
 
-    logger.info('Starting post-buy monitoring', {
-      mint,
-      devWallet: devWallet?.slice(0, 12) ?? 'unknown',
-    });
+    logger.info('Starting post-buy monitoring', { mint });
 
-    const intervalId = setInterval(async () => {
-      await this.pollMint(mint, onExitSignal);
+    const intervalId = setInterval(() => {
+      // Skip if previous poll still in flight — prevents overlapping polls
+      // when RPC latency exceeds POLL_INTERVAL_MS.
+      if (this.polling.has(mint)) return;
+      this.polling.add(mint);
+      this.pollMint(mint, onExitSignal)
+        .catch((err: unknown) => {
+          logger.debug('Post-buy poll threw', {
+            mint,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        })
+        .finally(() => {
+          this.polling.delete(mint);
+        });
     }, POLL_INTERVAL_MS);
 
     this.monitors.set(mint, {
       mint,
-      devWallet,
       startedAt: nowMs(),
       volumeBaseline: 0n,
       volumeCurrent: 0n,
@@ -117,17 +128,23 @@ export class PostBuyMonitor {
       holderBaseline: 0,
       lastHolderCount: 0,
       lastHolderCheckAt: 0,
-      devLastBalance: null,
       intervalId,
     });
 
     // First poll to establish baseline
-    void this.pollMint(mint, onExitSignal).catch((err: unknown) => {
-      logger.error('Initial post-buy poll failed', {
-        mint,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    });
+    if (!this.polling.has(mint)) {
+      this.polling.add(mint);
+      void this.pollMint(mint, onExitSignal)
+        .catch((err: unknown) => {
+          logger.error('Initial post-buy poll failed', {
+            mint,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        })
+        .finally(() => {
+          this.polling.delete(mint);
+        });
+    }
   }
 
   /**
@@ -184,7 +201,15 @@ export class PostBuyMonitor {
       const parsed = parseBondingCurveData(bcAccount.data);
       if (!parsed) return;
 
-      // ── CHECK 3: Holder Count Monitoring ──
+      // ── CHECK 3: Top-20 Holder Churn Detection ──
+      // NOTE: getTokenLargestAccounts returns at most 20 holders. This check
+      // measures "top-20 churn" (count of wallets in top-20 falling out), NOT
+      // total holder exodus. For total holder count, would need Helius DAS API
+      // (paginated, slower — see getRealHolderCount in dataProvider).
+      //
+      // Threshold tuned to 30% (was 50%): more sensitive to mass dump where
+      // top holders sell but new wallets enter. Even 6/20 dropping out (30%)
+      // signals coordinated dump pressure worth exiting on.
       // Check every 5 seconds after baseline established
       if (elapsed > HOLDER_BASELINE_MS && now - state.lastHolderCheckAt >= 5_000) {
         try {
@@ -199,8 +224,8 @@ export class PostBuyMonitor {
             const dropPct = ((state.lastHolderCount - holderCount) / state.lastHolderCount) * 100;
 
             if (dropPct >= HOLDER_DROP_THRESHOLD_PCT) {
-              const details = `Holder count dropped ${dropPct.toFixed(0)}%: ${state.lastHolderCount} → ${holderCount}`;
-              logger.warn('POST-BUY EXIT: Holder count drop', { mint, details });
+              const details = `Top-20 holder churn ${dropPct.toFixed(0)}%: ${state.lastHolderCount} → ${holderCount} holders`;
+              logger.warn('POST-BUY EXIT: Holder churn detected', { mint, details });
               this.stopMonitoring(mint);
               onExitSignal(mint, 'HOLDER_DROP', details);
               return;
@@ -216,7 +241,11 @@ export class PostBuyMonitor {
       }
 
       // ── CHECK 1: Volume Drop Detection ──
-      // Track volume from realSolReserves changes
+      // Track realSolReserves change across each window. Two signals:
+      //   - DROP: realSolReserves decreased from previous window baseline
+      //     → potential rug, holders are withdrawing SOL from curve
+      //   - STALL: realSolReserves flat (no growth) after warmup
+      //     → momentum dying, organic buyers gone
       const currentRealSol = parsed.realSolReserves;
       if (state.volumeBaseline === 0n) {
         state.volumeBaseline = currentRealSol;
@@ -224,59 +253,48 @@ export class PostBuyMonitor {
       } else {
         // Check if we've moved to a new window
         if (now - state.volumeWindowStart >= VOLUME_WINDOW_MS) {
-          const volumeDelta = currentRealSol > state.volumeBaseline
-            ? currentRealSol - state.volumeBaseline
-            : 0n;
-
-          if (state.volumeCurrent > 0n && volumeDelta > 0n) {
-            const dropPct = Number(((state.volumeCurrent - volumeDelta) * 10000n) / state.volumeCurrent) / 100;
-
-            if (dropPct >= VOLUME_DROP_THRESHOLD_PCT) {
-              const details = `Volume dropped ${dropPct.toFixed(0)}%: ${Number(state.volumeCurrent) / 1e9} SOL → ${Number(volumeDelta) / 1e9} SOL`;
-              logger.warn('POST-BUY EXIT: Volume drop detected', { mint, details });
+          const prevBaseline = state.volumeBaseline;
+          const solDelta = currentRealSol - prevBaseline; // signed: + = growth, - = drain
+          // volumeCurrent tracks PREVIOUS window's volume for comparison
+          if (state.volumeCurrent > 0n) {
+            if (solDelta < 0n) {
+              // RUG SIGNAL: SOL reserves decreased — holders withdrawing
+              const drainAbs = -solDelta;
+              const dropPct = Number((drainAbs * 10000n) / state.volumeCurrent) / 100;
+              if (dropPct >= VOLUME_DROP_THRESHOLD_PCT) {
+                const details = `SOL reserves drained ${dropPct.toFixed(0)}%: ` +
+                  `${Number(prevBaseline) / 1e9} → ${Number(currentRealSol) / 1e9} SOL`;
+                logger.warn('POST-BUY EXIT: Volume drop (SOL drain) detected', { mint, details });
+                this.stopMonitoring(mint);
+                onExitSignal(mint, 'VOLUME_DROP', details);
+                return;
+              }
+            } else if (solDelta === 0n && now - state.startedAt > VOLUME_WINDOW_MS * 3) {
+              // STALL: no growth for 3+ windows (30s+ with zero inflow) — momentum dead
+              const details = `Volume stall: SOL flat at ${Number(currentRealSol) / 1e9} SOL for ${VOLUME_WINDOW_MS * 3 / 1000}s`;
+              logger.warn('POST-BUY EXIT: Volume stall detected', { mint, details });
               this.stopMonitoring(mint);
               onExitSignal(mint, 'VOLUME_DROP', details);
               return;
             }
           }
-
-          state.volumeCurrent = volumeDelta;
+          // Update rolling state: previous window's volume becomes "volumeCurrent" for next comparison
+          state.volumeCurrent = solDelta > 0n ? solDelta : 0n;
           state.volumeBaseline = currentRealSol;
           state.volumeWindowStart = now;
         }
       }
 
       // ── CHECK 2: Dev Wallet Monitoring ──
-      if (state.devWallet) {
-        try {
-// devPk not needed - using mintPk for getTokenLargestAccounts
-          const devAccount = await this.connection.getTokenLargestAccounts(mintPk);
-          const devEntry = devAccount.value.find(
-            a => a.address.toBase58() === state.devWallet
-          );
-
-          const devBalance = devEntry ? BigInt(devEntry.amount) : 0n;
-
-          if (state.devLastBalance !== null && devBalance < state.devLastBalance) {
-            const sold = state.devLastBalance - devBalance;
-            const soldPct = state.devLastBalance > 0n
-              ? Number((sold * 10000n) / state.devLastBalance) / 100
-              : 0;
-
-            if (soldPct > 0) {
-              const details = `Dev wallet sold ${soldPct.toFixed(1)}% of holdings`;
-              logger.warn('POST-BUY EXIT: Dev wallet selling', { mint, details });
-              this.stopMonitoring(mint);
-              onExitSignal(mint, 'DEV_SELL', details);
-              return;
-            }
-          }
-
-          state.devLastBalance = devBalance;
-        } catch {
-          // Ignore dev wallet check errors
-        }
-      }
+      // REMOVED 2026-06-23: caller (FilteredSniperStrategy.onSignal line 574)
+      // always passes devWallet=null, AND the implementation used
+      // getTokenLargestAccounts which returns top-20 holders (not specific
+      // wallet). Creator drops out of top-20 within seconds after launch,
+      // so this check was dead code (would never fire correctly).
+      //
+      // If dev-wallet tracking is needed in future: use
+      // `getAccountInfo(devAta)` to read dev's specific token balance.
+      // Requires dev ATA derivation (getAssociatedTokenAddressSync).
 
     } catch (err: unknown) {
       logger.error('Post-buy poll failed', {

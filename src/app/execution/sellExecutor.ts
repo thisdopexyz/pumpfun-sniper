@@ -267,7 +267,7 @@ export async function executeSell(params: SellParams, runtime: ExecutionRuntime)
           : entrySolLamports;
         const solPriceUsd = await container.solPriceOracle.getSolPriceUsd();
         const pnlUsd = Number(amountSol - proportionalEntry) / 1e9 * solPriceUsd;
-        recordPnlAndRisk(container, pnlUsd, params.reason, tradeId, pos!.mint);
+        recordPnlAndRisk(container, pnlUsd, params.reason, tradeId, pos!.mint, runtime.crossTokenCorrelator);
       } catch (pnlErr: unknown) {
         logger.error('P&L recording failed (Jupiter) — activating cooldown anyway', { tradeId, error: pnlErr instanceof Error ? pnlErr.message : String(pnlErr) });
         container.cooldownManager.activateCooldown();
@@ -283,13 +283,43 @@ export async function executeSell(params: SellParams, runtime: ExecutionRuntime)
       });
       positionRegistry.transition(tradeId, 'EXITED', 'NO_TOKEN_BALANCE');
 
+      // BEFORE recording a "manual sell" with synthetic PnL, double-check by
+      // fetching the token account directly. A 429 on getUserTokenBalance would
+      // falsely report 0 and the synthetic PnL would record a phantom full-loss.
+      // Skip synthetic record if we can't confirm zero balance via a second path.
+      let confirmedZero = true;
+      try {
+        const spl = await import('@solana/spl-token');
+        const ata = await spl.getAssociatedTokenAddress(mint, user);
+        const ataAccount = await container.connection.getAccountInfo(ata);
+        if (ataAccount !== null) {
+          // ATA exists with data — balance could be > 0
+          confirmedZero = false;
+          logger.warn('ATA exists — getUserTokenBalance may have given false zero (RPC rate limit?)', {
+            tradeId, mint: pos.mint, ataLamports: ataAccount.lamports, ataDataLen: ataAccount.data.length,
+          });
+        }
+      } catch (verifyErr: unknown) {
+        // If we can't verify, lean toward NOT recording a synthetic loss
+        logger.warn('Could not verify zero balance — skipping synthetic PnL record', {
+          tradeId, error: verifyErr instanceof Error ? verifyErr.message : String(verifyErr),
+        });
+        confirmedZero = false;
+      }
+
+      if (!confirmedZero) {
+        // Don't record synthetic manual-sell with phantom loss. Just return failure
+        // so the strategy's failure counter increments and cooldown engages.
+        return { success: false, signature: null, error: 'Balance verification failed — assuming tokens still held' };
+      }
+
       // Manual sell detected: record PnL (loss) and activate cooldown.
       // Without this, bot immediately re-buys after manual sell.
       try {
         const entrySolLamports = pos.entryAmountSol ?? 0n;
         const solPriceUsd = await container.solPriceOracle.getSolPriceUsd();
         const pnlUsd = -Number(entrySolLamports) / 1e9 * solPriceUsd; // 0 exit = full loss
-        recordPnlAndRisk(container, pnlUsd, 'MANUAL_SELL', tradeId, pos.mint);
+        recordPnlAndRisk(container, pnlUsd, 'MANUAL_SELL', tradeId, pos.mint, runtime.crossTokenCorrelator);
         logger.info('Manual sell detected — PnL recorded, cooldown activated', {
           tradeId,
           pnlUsd: pnlUsd.toFixed(4),
@@ -313,7 +343,19 @@ export async function executeSell(params: SellParams, runtime: ExecutionRuntime)
     const { parsePoolStateData, isBonkfunToken } = await import('../../adapters/protocols/bonkfun/tokenParser.js');
 
     const bonkfunPoolPDA = deriveBonkfunPoolPDA(mint);
-    const bonkfunPoolAccount = await container.connection.getAccountInfo(bonkfunPoolPDA);
+    // BonkFun pool check must be ERROR-TOLERANT. A 429 or RPC error here should
+    // not abort the PumpFun sell — just treat as "not BonkFun" and continue.
+    // Otherwise rate limits on the pool-check RPC kill the entire sell path.
+    let bonkfunPoolAccount: import('@solana/web3.js').AccountInfo<Buffer> | null = null;
+    try {
+      bonkfunPoolAccount = await container.connection.getAccountInfo(bonkfunPoolPDA);
+    } catch (bonkfunCheckErr: unknown) {
+      logger.debug('BonkFun pool check failed (rate limit or RPC error) — assuming PumpFun', {
+        tradeId,
+        error: bonkfunCheckErr instanceof Error ? bonkfunCheckErr.message : String(bonkfunCheckErr),
+      });
+      // bonkfunPoolAccount stays null → fall through to PumpFun path
+    }
     let bonkfunGraduated = false;
 
     if (bonkfunPoolAccount?.data && bonkfunPoolAccount.data.length >= MIN_BONKFUN_POOL_STATE_SIZE) {
@@ -440,7 +482,7 @@ export async function executeSell(params: SellParams, runtime: ExecutionRuntime)
               : entrySolLamports;
             const solPriceUsd = await container.solPriceOracle.getSolPriceUsd();
             const pnlUsd = Number(confirmedSol - proportionalEntry) / 1e9 * solPriceUsd;
-            recordPnlAndRisk(container, pnlUsd, params.reason, tradeId, pos.mint);
+            recordPnlAndRisk(container, pnlUsd, params.reason, tradeId, pos.mint, runtime.crossTokenCorrelator);
           } catch (pnlErr: unknown) {
             logger.error('BonkFun PnL recording failed — activating cooldown anyway', {
               tradeId,
@@ -487,7 +529,22 @@ export async function executeSell(params: SellParams, runtime: ExecutionRuntime)
 
     // ── Fetch Bonding Curve State (PumpFun path) ─────────────────
     const bcPDA = deriveBondingCurvePDA(mint);
-    const bcAccount = await container.connection.getAccountInfo(bcPDA);
+    // bcAccount check must be error-tolerant. A 429 here used to abort the
+    // entire sell (caught at outer try/catch with generic "SELL FAILED" log).
+    // Now: log specifically, set bcAccount=null, and let downstream code
+    // produce a clearer error path so strategy's cooldown/backoff can engage.
+    let bcAccount: import('@solana/web3.js').AccountInfo<Buffer> | null = null;
+    try {
+      bcAccount = await container.connection.getAccountInfo(bcPDA);
+    } catch (bcFetchErr: unknown) {
+      logger.error('SELL FAILED — bonding curve RPC error (likely 429 rate limit)', {
+        tradeId,
+        error: bcFetchErr instanceof Error ? bcFetchErr.message : String(bcFetchErr),
+        action: 'cooldown_will_gate_retry',
+      });
+      container.cooldownManager.activateCooldown();
+      return { success: false, signature: null, error: 'BC RPC error: ' + (bcFetchErr instanceof Error ? bcFetchErr.message : String(bcFetchErr)) };
+    }
 
     // For BonkFun-graduated tokens: bonding curve doesn't exist.
     // Route directly to Jupiter sell (same path as PumpFun graduation).
@@ -803,7 +860,7 @@ export async function executeSell(params: SellParams, runtime: ExecutionRuntime)
       const exitSolLamports = confirmedSellAmountSol;
       const solPriceUsd = await container.solPriceOracle.getSolPriceUsd();
       const pnlUsd = Number(exitSolLamports - proportionalEntry) / 1e9 * solPriceUsd;
-      recordPnlAndRisk(container, pnlUsd, params.reason, tradeId, pos.mint);
+      recordPnlAndRisk(container, pnlUsd, params.reason, tradeId, pos.mint, runtime.crossTokenCorrelator);
     } catch (pnlErr: unknown) {
       logger.error('P&L recording failed — activating cooldown anyway', {
         tradeId,

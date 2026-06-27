@@ -49,8 +49,12 @@ import {
 // Offset    374: amm_creator_fee_on (u8 or struct)
 // Offset 375+: padding (62 bytes)
 
-/** Minimum account data length for a valid pool state account. */
-export const POOL_STATE_MIN_LEN = 357;
+/**
+ * Minimum account data length for a valid pool state account.
+ * VERIFIED ON-CHAIN 2026-06-23: all 20 queried BonkFun pool states are exactly
+ * 429 bytes. Matches MIN_BONKFUN_POOL_STATE_SIZE in programs.ts — keep in sync.
+ */
+export const POOL_STATE_MIN_LEN = 429;
 
 /** Discriminator size for Anchor accounts. */
 export const DISCRIMINATOR_SIZE = 8;

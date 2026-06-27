@@ -87,18 +87,9 @@ src/
 │   │   └── bundleDetector.ts            # Clustered wallet buys → BundleSignal
 │   ├── washTrade/
 │   │   └── washTradeDetector.ts         # Wash trade patterns → WashTradeSignal
-│   ├── cabal/
-│   │   └── cabalDetector.ts             # Coordinated wallet clusters → CabalSignal
-│   ├── dayPhase/
-│   │   └── dayPhaseDetector.ts          # ATH dip + sideways → DayPhaseSignal
-│   ├── dexPaid/
-│   │   └── dexPaidDetector.ts           # Late DEX listing → DexPaidSignal
-│   ├── holderConcentration/
-│   │   └── concentrationAnalyzer.ts     # High concentration → ConcentrationSignal
-│   ├── smartMoney/
-│   │   └── smartMoneyDetector.ts        # Smart wallet activity → SmartMoneySignal
-│   └── revoke/
-│       └── revokeAnalyzer.ts            # Authority revoke timing → RevokeSignal
+│   ├── holderConcentration/             # [REMOVED 2026-06-23 — dead code]
+│   └── smartMoney/
+│       └── smartMoneyDetector.ts        # Smart wallet activity → SmartMoneySignal
 │
 ├── risk/                                # Risk guards & controls
 │   ├── blacklist/
@@ -225,12 +216,8 @@ src/
 | MigrationSignalDetector | `MIGRATION` | Bonding curve → Raydium graduation |
 | BundleDetector | `BUNDLE` | Clustered wallet buys |
 | WashTradeDetector | `WASH_TRADE` | Wash trade patterns |
-| CabalDetector | `CABAL` | Coordinated wallet clusters |
-| DayPhaseDetector | `DAY_PHASE` | ATH dip + sideways cooldown |
-| DexPaidDetector | `DEX_PAID` | Late DEX listing (entry signal) |
-| ConcentrationAnalyzer | `CONCENTRATION` | High holder concentration |
+| ConcentrationAnalyzer | `CONCENTRATION` | [REMOVED 2026-06-23 — dead code, Check 8 uses evaluateConcentration directly] |
 | SmartMoneyDetector | `SMART_MONEY` | Smart wallet activity |
-| RevokeAnalyzer | `REVOKE` | Authority revoke timing |
 | (LiquidityPhase) | `LIQUIDITY_PHASE` | Bonding/graduated phase |
 
 ## Data Flow
@@ -241,8 +228,7 @@ WebSocket → wsMessageHandler → eventDecoder/launchParser
   → momentumDetector → MOMENTUM signal
   → bundleDetector → BUNDLE signal
   → washTradeDetector → WASH_TRADE signal
-  → cabalDetector → CABAL signal
-  → ... (12 detectors total)
+  → ... (8 detectors total)
     → strategy.onSignal()
       → dataProvider.getEntryCheckData() [RPC fetch]
       → entryCheckEvaluator [boolean evaluation]
